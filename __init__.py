@@ -1,22 +1,23 @@
 bl_info = {
     "name": "Painterly",
     "author": "Patrick Daugherty - Doughy Animation Studio",
-    "version": (2, 8, 2),
-    "blender": (4, 1, 0),
+    "version": (2, 5, 0), # Version updated to reflect major changes
+    "blender": (2, 9, 3),
     "location": "View3D > Sidebar > Painterly",
-    "description": ("Stylized painterly strokes and textures. "
+    "description": ("Stylized painterly strokes and textures with GPU acceleration and a real-time proxy workflow. "
                     "Create painterly strokes and normal map textures using handcrafted textures. Includes Geometry Node Mode."),
     "category": "3D View",
     "doc_url": "https://www.doughyanimation.com/painterly",
 }
 
 # Global version constant for UI display
-CURRENT_VERSION = (2, 8, 2)
+CURRENT_VERSION = (2, 5, 0)
+
 # URL for checking updates
 UPDATE_JSON_URL = (
-    "https://drive.google.com/uc?export=download"
-    "&id=1_dfqAKgrEgpYKArZAZnQ8KtAVlCiYNe7"
+    "https://raw.githubusercontent.com/Doughy-animation/Painterly/main/UPDATE_LATEST.JSON"
 )
+
 import bpy
 import os, random, subprocess, sys, time, math, json, urllib.request, shutil
 import io, zipfile, hashlib, importlib, concurrent.futures, re
@@ -36,12 +37,42 @@ from bpy.types import (
     Panel, Operator, PropertyGroup, AddonPreferences, UILayout, Menu
 )
 
+# --- NEW: GPU Acceleration & Renderer Backend ---
+try:
+    import cupy as cp
+    from cupyx.scipy.ndimage import affine_transform
+    CUPY_AVAILABLE = True
+    print("[Painterly] CuPy found. GPU acceleration is available.")
+except ImportError:
+    cp = None
+    affine_transform = None
+    CUPY_AVAILABLE = False
+    print("[Painterly] CuPy not found. Using CPU fallback for rendering.")
+
+
 # -------------------------------------------------------------------------
 # Helper utilities
 # -------------------------------------------------------------------------
 def get_addon_key() -> str:
     """Return the module-name Blender registered this file under."""
     return __name__
+
+def _obj_alive(obj) -> bool:
+    """Return True if 'obj' is a still-alive bpy.data.objects entry."""
+    try:
+        return (obj is not None) and (obj.name in bpy.data.objects)
+    except ReferenceError:
+        return False
+
+def _safe_data_update(obj):
+    """Safely call obj.data.update() if it's present and valid."""
+    try:
+        data = getattr(obj, "data", None)
+        upd = getattr(data, "update", None)
+        if callable(upd):
+            upd()
+    except ReferenceError:
+        pass
 
 def check_pillow() -> bool:
     import site
@@ -50,6 +81,7 @@ def check_pillow() -> bool:
         sys.path.append(user_site)
     try:
         import PIL
+        from PIL import Image, ImageDraw, ImageFilter
         return True
     except ImportError:
         return False
@@ -74,15 +106,95 @@ def compare_versions(v1, v2):
     elif len(v1) > len(v2):
         return 1
     return 0
+    
+# ---------------------------
+# MIGRATION & REPAIR
+# ---------------------------
+def _ensure_frame_count_on_material(mat):
+    """Recalculates and sets the 'frame_count' custom property if missing."""
+    if not mat or "frame_count" in mat:
+        return
+    nt = getattr(mat, "node_tree", None)
+    if not nt:
+        return
+    # Count frames by a reliable node naming convention
+    count = sum(1 for n in nt.nodes if n.name.startswith("StrokeBSDF_"))
+    if count > 0:
+        mat["frame_count"] = count
+
+def _repair_painterly_drivers_after_update(scene):
+    """
+    Finds old, unsafe driver expressions in materials and replaces them
+    with a hardened version to prevent division-by-zero errors on reload.
+    """
+    fixed_count = 0
+    for mat in bpy.data.materials:
+        if not mat.name.startswith("Painterly_"):
+            continue
+
+        _ensure_frame_count_on_material(mat)
+
+        nt = getattr(mat, "node_tree", None)
+        if not nt or not nt.animation_data:
+            continue
+            
+        for fcu in list(nt.animation_data.drivers or []):
+            drv = fcu.driver
+            if not drv or not drv.expression:
+                continue
+                
+            original_expr = drv.expression
+            repaired_expr = original_expr
+            
+            # Harden against step=0
+            if "/ step" in repaired_expr and "max(step, 1)" not in repaired_expr:
+                repaired_expr = repaired_expr.replace("/ step", "/ max(step, 1)")
+
+            # Harden against fc=0 or fc being missing
+            if "% fc" in repaired_expr and "max(fc, 1)" not in repaired_expr:
+                 repaired_expr = repaired_expr.replace("% fc", "% max(fc, 1)")
+                 
+            if repaired_expr != original_expr:
+                drv.expression = repaired_expr
+                fixed_count += 1
+
+                # Ensure all variables exist and are correctly targeted
+                vars = {v.name: v for v in drv.variables}
+                
+                if "frame" not in vars:
+                    v = drv.variables.new(); v.name = "frame"
+                else:
+                    v = vars["frame"]
+                v.targets[0].id_type = 'SCENE'; v.targets[0].id = scene; v.targets[0].data_path = "frame_current"
+
+                if "step" not in vars:
+                    v = drv.variables.new(); v.name = "step"
+                else:
+                    v = vars["step"]
+                v.targets[0].id_type = 'SCENE'; v.targets[0].id = scene; v.targets[0].data_path = "stroke_brush_properties.step_value"
+
+                if "fc" not in vars:
+                    v = drv.variables.new(); v.name = "fc"
+                else:
+                    v = vars["fc"]
+                v.targets[0].id_type = 'MATERIAL'; v.targets[0].id = mat; v.targets[0].data_path = '["frame_count"]'
+                    
+    if fixed_count > 0:
+        print(f"[Painterly] Repaired {fixed_count} outdated material drivers in the scene.")
 
 # ---------------------------
 # GLOBALS & DEBOUNCE VARIABLES
 # ---------------------------
 last_color_update_time = 0.0
-pending_inactive_ramps = []
 DEBOUNCE_INTERVAL = 0.1
 DEBOUNCE_TOTAL_DELAY = 0.2
 _in_update_color = False
+
+# ---------------------------
+# Robust ramp-update queue
+# ---------------------------
+pending_inactive_ramp_refs = []  # list of (material_name, node_name)
+_timer_registered = False
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +269,44 @@ def scan_directory_recursive(base_dir, collection):
         sub_path = os.path.join(base_dir, sub_name)
         if os.path.isdir(sub_path):
             scan_directory_recursive(sub_path, collection)
+
+def sync_combined_preset_list(context):
+    """
+    Clears and repopulates the preset_selections list to match the
+    discovered preset folders from both Painterly Texture and Stroke Pen modes.
+    Preserves selection state where possible.
+    """
+    folder_props = context.scene.painterly_folder_properties
+    stylized_props = context.scene.stylized_painterly_properties
+
+    old_selections = {item.path for item in stylized_props.preset_selections if item.selected}
+    stylized_props.preset_selections.clear()
+
+    for preset_folder in folder_props.preset_folders:
+        item = stylized_props.preset_selections.add()
+        item.name = f"[Texture] {preset_folder.name}"
+        item.path = preset_folder.path
+        if item.path in old_selections:
+            item.selected = True
+
+    if stylized_props.include_stroke_pen_alphas:
+        for stroke_type_folder in folder_props.stroke_type_folders:
+            item = stylized_props.preset_selections.add()
+            item.name = f"[Stroke Pen] {stroke_type_folder.name} (All)"
+            item.path = stroke_type_folder.path
+            if item.path in old_selections:
+                item.selected = True
+        
+        for stroke_type_folder in folder_props.stroke_type_folders:
+            for sub_name in os.listdir(stroke_type_folder.path):
+                 sub_path = os.path.join(stroke_type_folder.path, sub_name)
+                 if os.path.isdir(sub_path) and sub_name.lower() != "ui_image":
+                    item = stylized_props.preset_selections.add()
+                    item.name = f"[Stroke Pen] {stroke_type_folder.name} > {sub_name}"
+                    item.path = sub_path
+                    if item.path in old_selections:
+                        item.selected = True
+
 
 def scan_painterly_folders(context):
     """
@@ -270,9 +420,11 @@ def scan_painterly_folders(context):
                         pi.preview_image   = iconkey2
                         pi.preview_filepath= fullp
 
-    # Final recursive scan for the main stroke browser
     for main_item in props.stroke_type_folders:
         scan_directory_recursive(main_item.path, props.stroke_folders)
+    
+    sync_combined_preset_list(context)
+    
     print("[Painterly] scan_painterly_folders → completed")
 
 # ----- NEW ICON RELOAD CODE END -----
@@ -296,30 +448,46 @@ def _mirror_path_to_scene(prefs, context):
 
 class PAINTERLY_OT_install_dependencies(Operator):
     bl_idname = "painterly.install_dependencies"
-    bl_label  = "Install Dependencies (PIL)"
+    bl_label  = "Install Dependencies (PIL & CuPy)"
+    bl_description = "Installs Pillow for image processing and CuPy for GPU acceleration (NVIDIA only)"
 
     def execute(self, context):
         try:
+            # Install Pillow
+            self.report({'INFO'}, "Installing Pillow for image processing...")
             subprocess.check_call([sys.executable, "-m", "ensurepip", "--default-pip"])
-            cmd = [sys.executable, "-m", "pip", "install"]
+            cmd_pillow = [sys.executable, "-m", "pip", "install", "Pillow"]
             if platform.system() == "Windows":
-                cmd += ["--user"]
-            cmd += ["Pillow"]
-            subprocess.check_call(cmd)
+                cmd_pillow.insert(4, "--user")
+            subprocess.check_call(cmd_pillow)
+            self.report({'INFO'}, "Pillow installed successfully!")
+            
+            # Attempt to install CuPy
+            self.report({'INFO'}, "Attempting to install CuPy for GPU acceleration. This may take several minutes...")
+            # Let pip figure out the correct CUDA version. Using "cupy-cuda11x" is a safe bet for modern Blender versions.
+            cmd_cupy = [sys.executable, "-m", "pip", "install", "cupy-cuda11x"]
+            if platform.system() == "Windows":
+                cmd_cupy.insert(4, "--user")
+            try:
+                subprocess.check_call(cmd_cupy)
+                self.report({'INFO'}, "CuPy installed successfully! GPU acceleration is available.")
+            except subprocess.CalledProcessError:
+                self.report({'WARNING'}, "CuPy installation failed. This is expected if you don't have a compatible NVIDIA GPU or CUDA Toolkit. Addon will use CPU fallback.")
 
+            # Invalidate caches and set flag
             import site
+            importlib.reload(site)
             user_site = site.getusersitepackages()
             if user_site not in sys.path:
                 sys.path.append(user_site)
             importlib.invalidate_caches()
-            import PIL
             addon = context.preferences.addons.get(get_addon_key())
             if addon:
                 addon.preferences.dependencies_installed = True
-            self.report({'INFO'}, "Pillow installed successfully!")
+
             return {'FINISHED'}
         except Exception as e:
-            self.report({'ERROR'}, f"Installation failed: {e}")
+            self.report({'ERROR'}, f"An error occurred during installation: {e}")
             return {'CANCELLED'}
 
 
@@ -353,7 +521,6 @@ class PAINTERLY_OT_open_youtube(Operator):
 class PainterlyAddonPreferences(AddonPreferences):
     bl_idname = get_addon_key()
 
-    # stored prefs
     base_folder_path: StringProperty(
         name="Base Folder Path",
         subtype='DIR_PATH',
@@ -363,13 +530,11 @@ class PainterlyAddonPreferences(AddonPreferences):
     dependencies_installed: BoolProperty(name="Dependencies Installed", default=False)
     enable_auto_update:     BoolProperty(name="Enable Automatic Updates", default=True)
 
-    # ---- UI -------------------------------------------------------------
     def draw(self, context):
         layout = self.layout
-        props = context.scene.addon_properties # for updater status
+        props = context.scene.addon_properties 
         col = layout.column(align=True)
 
-        # ─────────────── Base folder selector ───────────────
         col.prop(self, "base_folder_path")
         if self.base_folder_path:
             col.label(text="Folder set and saved ✔", icon='CHECKMARK')
@@ -377,13 +542,21 @@ class PainterlyAddonPreferences(AddonPreferences):
             col.label(text="Not set – Painterly UI is hidden ⛔", icon='ERROR')
         col.operator("painterly.save_preferences", icon='FILE_TICK')
 
-        # ─────────────── Dependencies (Pillow / PIL) ────────
+        box_deps = col.box()
+        box_deps.label(text="Dependencies", icon='SCRIPTPLUGINS')
         if check_pillow():
-            col.label(text="PIL (Pillow) is installed ✔", icon='CHECKMARK')
+            box_deps.label(text="Pillow (CPU): Installed ✔", icon='CHECKMARK')
         else:
-            col.operator("painterly.install_dependencies", icon='IMPORT')
+            box_deps.label(text="Pillow (CPU): Not Installed ⛔", icon='ERROR')
+        
+        if CUPY_AVAILABLE:
+            box_deps.label(text="CuPy (GPU): Installed ✔", icon='CHECKMARK')
+        else:
+            box_deps.label(text="CuPy (GPU): Not Installed", icon='INFO')
+        
+        box_deps.operator("painterly.install_dependencies", icon='CONSOLE')
 
-        # ─────────────── Auto-update toggle ─────────────────
+
         box = col.box()
         box.label(text="Automatic Updater", icon='FILE_REFRESH')
         box.prop(self, "enable_auto_update", text="Enable Auto Updates", toggle=True)
@@ -402,7 +575,6 @@ class PainterlyAddonPreferences(AddonPreferences):
                     box.label(text="No Updates Available", icon='CHECKMARK')
                     box.operator("painterly.check_for_updates", text="Check Again")
 
-        # ─────────────── Misc links ─────────────────────────
         row = col.row(align=True)
         row.operator("painterly.open_feedback", icon='HELP')
         row.operator("painterly.open_youtube",  icon='URL')
@@ -411,28 +583,47 @@ class PainterlyAddonPreferences(AddonPreferences):
 # ----- NEW COLOR MIXER CODE START -----
 
 def schedule_inactive_ramp_updates(context):
-    """Start / keep alive the timer that refreshes hidden ramps."""
-    bpy.app.timers.register(
-        debounce_update_inactive_ramp_nodes,
-        first_interval=DEBOUNCE_INTERVAL
-    )
+    """Register a single-shot timer if not already registered."""
+    global _timer_registered
+    try:
+        if not _timer_registered or not bpy.app.timers.is_registered(debounce_update_inactive_ramp_nodes):
+            _timer_registered = True
+            bpy.app.timers.register(debounce_update_inactive_ramp_nodes, first_interval=DEBOUNCE_TOTAL_DELAY)
+    except Exception as e:
+        print("schedule_inactive_ramp_updates error:", e)
+
 
 def debounce_update_inactive_ramp_nodes():
-    global last_color_update_time, pending_inactive_ramps
+    """
+    Fire after the user stops dragging sliders for DEBOUNCE_TOTAL_DELAY.
+    Drain the whole queue in one go, re-resolving nodes by (material_name, node_name).
+    Stop the timer when done.
+    """
+    global last_color_update_time, pending_inactive_ramp_refs, _timer_registered
+
     try:
-        if bpy.context.scene is None:
-            return DEBOUNCE_INTERVAL
-
+        # Keep waiting while the user is still interacting.
         if time.time() - last_color_update_time < DEBOUNCE_TOTAL_DELAY:
-            return DEBOUNCE_INTERVAL
+            return DEBOUNCE_INTERVAL  # keep deferring
 
-        if pending_inactive_ramps:
-            node = pending_inactive_ramps.pop(0)
-            update_ramp_node(node)
+        # Drain the queue atomically
+        while pending_inactive_ramp_refs:
+            mat_name, node_name = pending_inactive_ramp_refs.pop(0)
+
+            mat = bpy.data.materials.get(mat_name)
+            if not mat or not mat.node_tree:
+                continue
+
+            node = mat.node_tree.nodes.get(node_name)
+            if node and node.type == 'VALTORGB':
+                update_ramp_node(node)
+
     except Exception as e:
         print("Error in debounce_update_inactive_ramp_nodes:", e)
 
-    return DEBOUNCE_INTERVAL
+    # Done; turn the timer off
+    _timer_registered = False
+    return None  # stop the timer
 
 def update_ramp_node(node):
     """
@@ -480,7 +671,7 @@ def update_color(context):
     Kick-off routine that updates the *active* ramp immediately and
     queues all *inactive* ramps for deferred update (debounced).
     """
-    global _in_update_color, last_color_update_time, pending_inactive_ramps
+    global _in_update_color, last_color_update_time, pending_inactive_ramp_refs
     last_color_update_time = time.time()
     props = context.scene.stroke_brush_properties
 
@@ -494,7 +685,7 @@ def update_color(context):
     _in_update_color = True
     try:
         update_active_color_ramp(context)
-        pending_inactive_ramps = []
+        pending_inactive_ramp_refs.clear()
         obj = context.object
         if obj and obj.type == 'CURVE' and obj.data.materials:
             mat = obj.data.materials[0]
@@ -510,7 +701,8 @@ def update_color(context):
                     try:
                         node_index = int(node.name.split("_")[1])
                         if node_index != active_index:
-                            pending_inactive_ramps.append(node)
+                            # Queue a stable reference we can resolve later
+                            pending_inactive_ramp_refs.append((mat.name, node.name))
                     except (ValueError, IndexError):
                         continue
         
@@ -537,6 +729,19 @@ def update_extras_strokes(context):
             else:
                 obj.data.resolution_u = 12
                 obj.data.render_resolution_u = 12
+
+def refresh_all_painterly_strokes(context):
+    """
+    On file load or addon reload, iterates through all Painterly strokes
+    and reapplies crucial material settings to prevent glitches.
+    """
+    for obj in bpy.data.objects:
+        if obj.name.startswith("Painterly_") and obj.type == 'CURVE' and obj.active_material:
+            override_context = context.copy()
+            override_context['object'] = obj
+            
+            update_material_properties(override_context)
+            update_alpha_channel(override_context)
 
 # ---------------------------
 # Other Operators
@@ -607,9 +812,26 @@ class FolderItem(PropertyGroup):
 
 def get_main_folder_items(self, context):
     items = [("ALL", "ALL", "Gather from all folders")]
+    stroke_props = context.scene.stroke_brush_properties
+    animation_mode = stroke_props.animation_mode
+
     if self.stroke_type_folders:
         for i, folder in enumerate(self.stroke_type_folders):
-            items.append((str(i), folder.name, f"Select {folder.name} category"))
+            is_static_folder = folder.name.endswith(" - Static")
+            
+            # If in animated mode, skip static folders
+            if animation_mode == 'ANIMATED' and is_static_folder:
+                continue
+            
+            # Prepare display name and icon
+            display_name = folder.name
+            icon = 'NONE'
+            if is_static_folder:
+                display_name = folder.name.removesuffix(" - Static").strip()
+                icon = 'STAR'
+                
+            items.append((str(i), display_name, f"Select {display_name} category", icon, i + 1))
+
     if len(items) == 1:
         items = [('0', "No Categories", "No categories available")]
     return items
@@ -625,7 +847,6 @@ def get_subfolder_items(self, context):
     return items
 
 class PainterlyFolderProperties(PropertyGroup):
-    # This class is now a scene-side proxy. The master path is in AddonPreferences.
     base_path: StringProperty(default="")
     folder_configured: BoolProperty(default=False)
     
@@ -704,13 +925,81 @@ class PainterlyFolderProperties(PropertyGroup):
 # GEOMETRY NODE MODE - HELPER FUNCTIONS (Blender 4.0+)
 # ---------------------------
 def get_geo_node_modifier(obj):
-    """Finds the Painterly Geometry Nodes modifier on an object."""
-    if not obj:
+    """Finds the Painterly Geometry Nodes modifier on an object (safe)."""
+    try:
+        if not _obj_alive(obj):
+            return None
+        for mod in obj.modifiers:
+            if getattr(mod, "type", None) == 'NODES':
+                ng = getattr(mod, "node_group", None)
+                if ng and getattr(ng, "name", "").startswith("Painterly_GN_"):
+                    return mod
+    except ReferenceError:
         return None
-    for mod in obj.modifiers:
-        if mod.type == 'NODES' and mod.node_group and mod.node_group.name.startswith("Painterly_GN_"):
-            return mod
     return None
+
+def _secondary_safe_name(obj_name: str) -> str:
+    import re
+    return re.sub(r'[^\w\s-]', '', obj_name).replace(' ', '_')
+
+def _get_instance_nodes(ng, secondary_name):
+    """Return (dist_node, group_input_node, links) for this instance."""
+    dist = ng.nodes.get(f"Distribute_{secondary_name}")
+    n_in = ng.nodes.get("Group Input")
+    return dist, n_in, ng.links if ng else (None, None, None)
+
+def _set_density_factor_link(ng, ss_prop, secondary_name, connect: bool):
+    """
+    connect=True  -> ensure Group Input socket -> Distribute.Density Factor link exists
+    connect=False -> remove that link and set the socket's default to 1.0
+    Works across Blender versions ("Density Factor" vs "Density").
+    """
+    if not ng or not ss_prop or not ss_prop.density_mask_socket_identifier:
+        return
+    dist, n_in, links = _get_instance_nodes(ng, secondary_name)
+    if not (dist and n_in):
+        return
+
+    target_input = dist.inputs.get("Density Factor") or dist.inputs.get("Density")
+    if not target_input:
+        return
+
+    # Remove existing links to that input (if any)
+    for lnk in list(links):
+        if lnk.to_node == dist and lnk.to_socket == target_input:
+            links.remove(lnk)
+
+    if connect:
+        # Recreate link from the correct Group Input socket by identifier
+        out = next((s for s in n_in.outputs if s.identifier == ss_prop.density_mask_socket_identifier), None)
+        if out:
+            links.new(out, target_input)
+    else:
+        # When disconnected, make sure we default to 1.0 (full density)
+        try:
+            target_input.default_value = 1.0
+        except Exception:
+            pass
+
+def _force_gn_refresh(obj):
+    """Nudge Blender to re-evaluate GeoNodes after modifier/links change."""
+    try:
+        if not _obj_alive(obj):
+            return
+        mod = get_geo_node_modifier(obj)
+        if not mod:
+            return
+
+        # Toggle viewport flag to force depsgraph recalc
+        vis = mod.show_viewport
+        mod.show_viewport = False
+        mod.show_viewport = vis
+
+        obj.update_tag()
+        _safe_data_update(obj)
+    except ReferenceError:
+        # Under deletion / undo, silently ignore
+        return
 
 def create_painterly_geo_nodes_group(context, primary_stroke_object):
     """
@@ -725,13 +1014,14 @@ def create_painterly_geo_nodes_group(context, primary_stroke_object):
     interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type='NodeSocketGeometry')
 
     n_in = ng.nodes.new("NodeGroupInput")
-    n_in.name = "Group Input" # Keep default name for easier lookup
+    n_in.name = "Group Input"
     n_in.location = (-300, 0)
     
     n_out = ng.nodes.new("NodeGroupOutput")
     n_out.location = (600, 0)
     
     n_setmat = ng.nodes.new("GeometryNodeSetMaterial")
+    n_setmat.name = "Painterly_Set_Material"
     n_setmat.location = (0, -150)
     if primary_stroke_object.active_material:
         n_setmat.inputs["Material"].default_value = primary_stroke_object.active_material
@@ -740,15 +1030,20 @@ def create_painterly_geo_nodes_group(context, primary_stroke_object):
     n_join.name = "Painterly_Join"
     n_join.location = (300, 0)
 
-    # Link up the base mesh pass-through
     ng.links.new(n_in.outputs["Geometry"], n_setmat.inputs["Geometry"])
     ng.links.new(n_setmat.outputs["Geometry"], n_join.inputs[0])
     ng.links.new(n_join.outputs["Geometry"], n_out.inputs["Geometry"])
 
-    # Add the modifier to the object
     mod = primary_stroke_object.modifiers.new(name="Painterly Geo Nodes", type='NODES')
     mod.node_group = ng
     
+    # If a wave modifier exists, move the new GN modifier below it.
+    wave_mod = primary_stroke_object.modifiers.get("Painterly_Wave")
+    if wave_mod:
+        wave_mod_index = primary_stroke_object.modifiers.find("Painterly_Wave")
+        if wave_mod_index != -1:
+            bpy.ops.object.modifier_move_to_index(modifier=mod.name, index=wave_mod_index + 1)
+
     return mod
 
 # ---------------------------
@@ -762,34 +1057,40 @@ def get_primary_stroke_collections(self, context):
         return [("NONE", "No Primary Strokes", "Create a Primary Stroke first")]
         
     for i, ps in enumerate(geo_props.primary_strokes):
-        if ps.obj:
+        if _obj_alive(ps.obj):
             items.append((str(i), ps.obj.name, f"Instance to '{ps.obj.name}'"))
     return items
 
 def update_geo_node_instance_values(self, context):
     """Directly updates the values of named nodes within a specific instance branch."""
+    # Find owning primary/secondary safely
     primary_stroke = None
     secondary_stroke_prop = None
-    for ps in context.scene.geo_node_properties.primary_strokes:
-        for ss in ps.secondary_strokes:
-            if ss.as_pointer() == self.as_pointer():
-                primary_stroke = ps
-                secondary_stroke_prop = ss
+    try:
+        for ps in context.scene.geo_node_properties.primary_strokes:
+            for ss in ps.secondary_strokes:
+                if ss.as_pointer() == self.as_pointer():
+                    primary_stroke = ps
+                    secondary_stroke_prop = ss
+                    break
+            if primary_stroke:
                 break
-        if primary_stroke:
-            break
-            
-    if not primary_stroke or not primary_stroke.obj:
+    except ReferenceError:
+        return
+
+    # Validate objects
+    if not primary_stroke or not _obj_alive(primary_stroke.obj):
+        return
+    if not secondary_stroke_prop or not _obj_alive(secondary_stroke_prop.obj):
         return
 
     mod = get_geo_node_modifier(primary_stroke.obj)
-    if not mod or not mod.node_group:
+    if not mod or not getattr(mod, "node_group", None):
         return
-        
-    nodes = mod.node_group.nodes
-    
-    if not secondary_stroke_prop.obj: return
 
+    ng = mod.node_group
+    nodes = ng.nodes
+    
     secondary_name = re.sub(r'[^\w\s-]', '', secondary_stroke_prop.obj.name).replace(' ', '_')
     
     dist_node = nodes.get(f"Distribute_{secondary_name}")
@@ -800,27 +1101,83 @@ def update_geo_node_instance_values(self, context):
     align_rot_node = nodes.get(f"AlignRotation_{secondary_name}")
     switch_node = nodes.get(f"SwitchRotation_{secondary_name}")
 
-    if dist_node: dist_node.inputs["Density"].default_value = self.density
+    if dist_node: dist_node.inputs["Density Max"].default_value = self.density
     if scale_node: scale_node.inputs["Max"].default_value = self.scale
     if rot_node: rot_node.inputs["Max"].default_value = (self.rotation_randomness * math.pi * 2, self.rotation_randomness * math.pi * 2, self.rotation_randomness * math.pi * 2)
     if merge_node: merge_node.inputs["Distance"].default_value = self.merge_distance
     
     if transform_node:
         transform_node.inputs['Translation'].default_value = self.translation
-        # The 'rotation' property is already in radians because its subtype is 'EULER'.
-        # No extra conversion is needed.
         transform_node.inputs['Rotation'].default_value = self.rotation
         transform_node.inputs['Scale'].default_value = self.scale_transform
 
     if align_rot_node:
-        if hasattr(align_rot_node, 'rotation_type'):  # Blender 4.1+
+        if hasattr(align_rot_node, 'rotation_type'):
             align_rot_node.rotation_type = self.align_axis + '_AXIS'
-        elif hasattr(align_rot_node, 'axis'): # Blender 4.0
+        elif hasattr(align_rot_node, 'axis'):
             align_rot_node.axis = self.align_axis
         
     if switch_node:
         switch_node.inputs['Switch'].default_value = self.use_align_rotation
 
+    if not self.density_mask_socket_identifier and _obj_alive(primary_stroke.obj):
+        mod = get_geo_node_modifier(primary_stroke.obj)
+        if mod and mod.node_group and _obj_alive(self.obj):
+            safe_obj_name = re.sub(r'[^\w\s-]', '', self.obj.name).replace(' ', '_')
+            expected_name = f"Density Mask {safe_obj_name}"
+            for item in mod.node_group.interface.items_tree:
+                if getattr(item, "name", "") == expected_name:
+                    self.density_mask_socket_identifier = item.identifier
+                    break
+
+    # --- DENSITY MASK: modifier keys + live link management + refresh ---
+    if self.density_mask_socket_identifier:
+        # Re-find primary stroke safely, as it could have changed
+        current_primary_stroke = None
+        try:
+            for ps in context.scene.geo_node_properties.primary_strokes:
+                for ss in ps.secondary_strokes:
+                    if ss.as_pointer() == self.as_pointer():
+                        current_primary_stroke = ps
+                        break
+                if current_primary_stroke:
+                    break
+        except ReferenceError:
+            return
+
+        if not current_primary_stroke or not _obj_alive(current_primary_stroke.obj):
+            return
+
+        mod = get_geo_node_modifier(current_primary_stroke.obj)
+        ng = mod.node_group if (mod and mod.node_group) else None
+
+        key_use  = f"{self.density_mask_socket_identifier}_use_attribute"
+        key_name = f"{self.density_mask_socket_identifier}_attribute_name"
+
+        vg_is_valid = False
+        if self.use_density_mask and self.density_vertex_group:
+            obj = current_primary_stroke.obj
+            vg_is_valid = (obj.type == 'MESH') and (self.density_vertex_group in {vg.name for vg in obj.vertex_groups})
+
+        if mod:
+            if vg_is_valid:
+                mod[key_use]  = True
+                mod[key_name] = self.density_vertex_group
+            else:
+                mod[key_use] = False
+                if key_name in mod:
+                    try:
+                        del mod[key_name]
+                    except TypeError:
+                        pass
+        
+        if ng and _obj_alive(self.obj):
+            sec_name = _secondary_safe_name(self.obj.name)
+            _set_density_factor_link(ng, self, sec_name, connect=(self.use_density_mask and vg_is_valid))
+
+        if current_primary_stroke and _obj_alive(current_primary_stroke.obj):
+            _force_gn_refresh(current_primary_stroke.obj)
+            
     return None
 
 class GeoNodeSecondaryStroke(PropertyGroup):
@@ -828,10 +1185,14 @@ class GeoNodeSecondaryStroke(PropertyGroup):
     name: StringProperty(name="Name")
     obj: PointerProperty(type=bpy.types.Object, name="Secondary Stroke Object")
     
-    density: FloatProperty(name="Density", default=0.1, min=0.0, max=1000.0, update=update_geo_node_instance_values, step=10)
+    density: FloatProperty(name="Density Max", default=10.0, min=0.0, max=1000.0, update=update_geo_node_instance_values, step=10)
     scale: FloatProperty(name="Scale", description="Controls the maximum random scale of instances", default=1.0, min=0.0, max=50.0, update=update_geo_node_instance_values, step=1)
     rotation_randomness: FloatProperty(name="Rotation", default=1.0, min=0.0, max=1.0, update=update_geo_node_instance_values, description="Controls the maximum random rotation on all axes")
     merge_distance: FloatProperty(name="Merge Distance", default=0.0, min=0.0, max=10.0, update=update_geo_node_instance_values, step=1, precision=3)
+
+    use_density_mask: BoolProperty(name="Use Density Mask", default=False, update=update_geo_node_instance_values, description="Use a vertex group from the primary object to control instance density")
+    density_vertex_group: StringProperty(name="Vertex Group", update=update_geo_node_instance_values, description="Name of the vertex group to use as a density mask")
+    density_mask_socket_identifier: StringProperty()
 
     align_rotation_available: BoolProperty(name="Align Rotation Available", default=True)
     use_align_rotation: BoolProperty(name="Align Rotation to Vector", default=False, update=update_geo_node_instance_values)
@@ -867,6 +1228,36 @@ class GeoNodeProperties(PropertyGroup):
 # ---------------------------
 # GEOMETRY NODE MODE - OPERATORS (Blender 4.0+)
 # ---------------------------
+class PAINTERLY_OT_RefreshPrimaryMaterial(Operator):
+    bl_idname = "painterly.refresh_material"
+    bl_label = "Refresh Primary Material"
+    bl_description = "Updates the Geometry Node setup to use the primary object's current material"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    primary_stroke_index: IntProperty()
+
+    def execute(self, context):
+        geo_props = context.scene.geo_node_properties
+        if self.primary_stroke_index >= len(geo_props.primary_strokes):
+            return {'CANCELLED'}
+            
+        primary_stroke = geo_props.primary_strokes[self.primary_stroke_index]
+        obj = primary_stroke.obj
+        if not _obj_alive(obj):
+            return {'CANCELLED'}
+
+        mod = get_geo_node_modifier(obj)
+        if not mod or not mod.node_group:
+            return {'CANCELLED'}
+        
+        set_mat_node = mod.node_group.nodes.get("Painterly_Set_Material")
+        if set_mat_node:
+            set_mat_node.inputs["Material"].default_value = obj.active_material
+            self.report({'INFO'}, f"Material updated for '{obj.name}'.")
+        
+        return {'FINISHED'}
+
+
 class PAINTERLY_OT_AddPrimaryStroke(Operator):
     bl_idname = "painterly.add_primary_stroke"
     bl_label = "Add Primary Stroke"
@@ -919,7 +1310,7 @@ class PAINTERLY_OT_InstanceStroke(Operator):
         primary_stroke_target = geo_props.primary_strokes[target_idx]
         primary_obj = primary_stroke_target.obj
         
-        if not primary_obj:
+        if not _obj_alive(primary_obj):
             self.report({'ERROR'}, "Target Primary Stroke object not found.")
             return {'CANCELLED'}
 
@@ -940,6 +1331,7 @@ class PAINTERLY_OT_InstanceStroke(Operator):
 
         added_count = 0
         for secondary_obj in context.selected_objects:
+            if not _obj_alive(secondary_obj): continue
             if primary_obj == secondary_obj: continue
             if any(ps.obj == secondary_obj for ps in geo_props.primary_strokes): continue
             if any(ss.obj == secondary_obj for ss in primary_stroke_target.secondary_strokes): continue
@@ -948,12 +1340,32 @@ class PAINTERLY_OT_InstanceStroke(Operator):
             ss_prop.name = secondary_obj.name
             ss_prop.obj = secondary_obj
 
-            secondary_name = re.sub(r'[^\w\s-]', '', secondary_obj.name).replace(' ', '_')
-            y_pos = -450 * (len(primary_stroke_target.secondary_strokes))
+            secondary_name = _secondary_safe_name(secondary_obj.name)
+            y_pos = -550 * (len(primary_stroke_target.secondary_strokes))
             
             n_dist = nodes.new("GeometryNodeDistributePointsOnFaces")
             n_dist.name = f"Distribute_{secondary_name}"; n_dist.location = (-50, y_pos)
-            n_dist.distribute_method = 'RANDOM'
+            n_dist.distribute_method = 'POISSON'
+            
+            if "Density Max" in n_dist.inputs:
+                n_dist.inputs["Density Max"].default_value = ss_prop.density
+            elif "Density" in n_dist.inputs:
+                n_dist.inputs["Density"].default_value = ss_prop.density
+
+            socket_name = f"Density Mask {secondary_name}"
+            socket_item = ng.interface.new_socket(name=socket_name, in_out="INPUT", socket_type='NodeSocketFloat')
+            socket_item.subtype = 'FACTOR'
+            socket_item.default_value = 1.0
+            socket_item.min_value = 0.0
+            socket_item.max_value = 1.0
+            socket_item.description = "Vertex group mask for instance density"
+            ss_prop.density_mask_socket_identifier = socket_item.identifier
+
+            mask_socket = next((s for s in n_in.outputs if s.identifier == ss_prop.density_mask_socket_identifier), None)
+            if mask_socket:
+                target_density_factor = n_dist.inputs.get("Density Factor") or n_dist.inputs.get("Density")
+                if target_density_factor:
+                    links.new(mask_socket, target_density_factor)
 
             n_obj_info = nodes.new("GeometryNodeObjectInfo")
             n_obj_info.name = f"ObjInfo_{secondary_name}"; n_obj_info.location = (200, y_pos + 150)
@@ -979,26 +1391,19 @@ class PAINTERLY_OT_InstanceStroke(Operator):
             n_transform.name = f"Transform_{secondary_name}"; n_transform.location = (1450, y_pos)
 
             n_align_rot = None
-            # This block attempts to create the rotation alignment node,
-            # trying the Blender 4.1+ name first, then falling back to the 4.0 name.
             try:
-                # Try the node name for Blender 4.1+
                 n_align_rot = nodes.new("GeometryNodeVectorToRotation")
             except RuntimeError:
                 try:
-                    # If the first attempt fails, try the older node name for Blender 4.0
                     n_align_rot = nodes.new("FunctionNodeAlignRotationToVector")
                 except RuntimeError:
-                    # If both names fail, the node is not available.
                     n_align_rot = None
 
             if n_align_rot:
-                # If the node was created successfully with either name, configure it.
                 n_align_rot.name = f"AlignRotation_{secondary_name}"
                 n_align_rot.location = (450, y_pos - 350)
                 ss_prop.align_rotation_available = True
             else:
-                # If the node could not be created, disable the feature and warn the user.
                 ss_prop.align_rotation_available = False
                 self.report({'WARNING'}, "'Vector to Rotation' node not found. Alignment feature disabled.")
 
@@ -1016,13 +1421,11 @@ class PAINTERLY_OT_InstanceStroke(Operator):
                 n_switch.location = (700, y_pos - 200)
                 n_switch.input_type = 'ROTATION'
                 
-                # Use named sockets instead of indices
                 links.new(n_rand_rot.outputs["Value"], n_switch.inputs['False'])
                 links.new(n_align_rot.outputs['Rotation'], n_switch.inputs['True'])
                 links.new(n_dist.outputs['Normal'], n_align_rot.inputs['Vector'])
                 links.new(n_switch.outputs['Output'], n_instance.inputs['Rotation'])
             else:
-                # Fallback to only random rotation if alignment node is not available
                 links.new(n_rand_rot.outputs["Value"], n_instance.inputs['Rotation'])
 
             update_geo_node_instance_values(ss_prop, context)
@@ -1055,13 +1458,12 @@ class PAINTERLY_OT_RemovePrimaryStroke(Operator):
         primary_to_remove = geo_props.primary_strokes[self.primary_stroke_index]
         obj = primary_to_remove.obj
 
-        # Make secondary strokes visible again
         for ss in primary_to_remove.secondary_strokes:
-            if ss.obj:
+            if _obj_alive(ss.obj):
                 ss.obj.hide_set(False)
                 ss.obj.hide_render = False
 
-        if obj:
+        if _obj_alive(obj):
             mod = get_geo_node_modifier(obj)
             if mod:
                 ng = mod.node_group
@@ -1090,31 +1492,34 @@ class PAINTERLY_OT_RemoveSecondaryStroke(Operator):
         primary_obj = primary_stroke.obj
         secondary_obj = secondary_stroke.obj
 
-        if not primary_obj or not secondary_obj:
+        if not _obj_alive(primary_obj):
+            # Primary is gone, just remove the property
+            primary_stroke.secondary_strokes.remove(self.secondary_stroke_index)
             return {'CANCELLED'}
 
-        # Remove nodes from GN tree
+        secondary_name_stored = secondary_stroke.name # Store before potential removal
+        
         mod = get_geo_node_modifier(primary_obj)
         if mod and mod.node_group:
             ng = mod.node_group
-            secondary_name = re.sub(r'[^\w\s-]', '', secondary_obj.name).replace(' ', '_')
+            safe_secondary_name = _secondary_safe_name(secondary_name_stored)
             
-            nodes_to_remove = []
-            for node in ng.nodes:
-                if node.name.endswith(f"_{secondary_name}"):
-                    nodes_to_remove.append(node)
-            
+            nodes_to_remove = [n for n in ng.nodes if n.name.endswith(f"_{safe_secondary_name}")]
             for node in nodes_to_remove:
                 ng.nodes.remove(node)
+            
+            if secondary_stroke.density_mask_socket_identifier:
+                socket_to_remove = next((item for item in ng.interface.items_tree if item.identifier == secondary_stroke.density_mask_socket_identifier), None)
+                if socket_to_remove:
+                    ng.interface.remove(socket_to_remove)
 
-        # Unhide the object
-        secondary_obj.hide_set(False)
-        secondary_obj.hide_render = False
+        if _obj_alive(secondary_obj):
+            secondary_obj.hide_set(False)
+            secondary_obj.hide_render = False
         
-        # Remove from property group
         primary_stroke.secondary_strokes.remove(self.secondary_stroke_index)
 
-        self.report({'INFO'}, f"Removed instance '{secondary_obj.name}' from '{primary_obj.name}'.")
+        self.report({'INFO'}, f"Removed instance '{secondary_name_stored}' from '{primary_obj.name}'.")
         return {'FINISHED'}
         
 class PAINTERLY_OT_SelectObject(Operator):
@@ -1131,7 +1536,6 @@ class PAINTERLY_OT_SelectObject(Operator):
             self.report({'WARNING'}, f"Object '{self.obj_name}' not found.")
             return {'CANCELLED'}
         
-        # Make the object visible before selecting
         obj.hide_set(False)
         obj.hide_render = False
             
@@ -1154,7 +1558,6 @@ class PAINTERLY_OT_ToggleInstanceVisibility(Operator):
             self.report({'WARNING'}, f"Object '{self.obj_name}' not found.")
             return {'CANCELLED'}
 
-        # Toggle visibility
         new_hide_state = not obj.hide_get()
         obj.hide_set(new_hide_state)
         obj.hide_render = new_hide_state
@@ -1189,13 +1592,11 @@ def update_effect_nodes(context):
     if not mat or not mat.node_tree:
         return
     node_tree = mat.node_tree
-    # Remove old effect nodes
     for nd in list(node_tree.nodes):
         if nd.name.startswith("PainterlyMagic") or nd.name.startswith("PainterlyVoronoi") or nd.name.startswith("PainterlyNoise"):
             node_tree.nodes.remove(nd)
     if props.effect_type == EFFECT_NONE:
         return
-    # Ensure TEX_COORD and MAPPING nodes exist
     texcoord_node, mapping_node = None, None
     for nd in node_tree.nodes:
         if nd.type == 'TEX_COORD':
@@ -1209,7 +1610,6 @@ def update_effect_nodes(context):
     if not any(link.from_node == texcoord_node and link.to_node == mapping_node for link in node_tree.links):
         if "Generated" in texcoord_node.outputs:
             node_tree.links.new(texcoord_node.outputs["Generated"], mapping_node.inputs["Vector"])
-    # Create the selected effect node
     effect_node = None
     if props.effect_type == EFFECT_MAGIC:
         node = node_tree.nodes.new("ShaderNodeTexMagic")
@@ -1248,9 +1648,7 @@ def update_effect_nodes(context):
         effect_node = node
     if not effect_node:
         return
-    # Connect the effect node to the mapping node
     node_tree.links.new(effect_node.inputs["Vector"], mapping_node.outputs["Vector"])
-    # For each image texture node, use the helper function to set its "Vector" input
     for nd in node_tree.nodes:
         if nd.type == 'TEX_IMAGE' and (nd.name.startswith("StrokeFrame_") or nd.name.startswith("NormalFrame_")):
             if nd.name.startswith("StrokeFrame_"):
@@ -1302,10 +1700,14 @@ def update_active_color_ramp(context):
                     update_ramp_node(node)
 
 def update_inactive_color_ramps(context):
-    global pending_inactive_ramps
-    if pending_inactive_ramps:
-        ramp_node = pending_inactive_ramps.pop(0)
-        update_ramp_node(ramp_node)
+    global pending_inactive_ramp_refs
+    if pending_inactive_ramp_refs:
+        mat_name, node_name = pending_inactive_ramp_refs.pop(0)
+        mat = bpy.data.materials.get(mat_name)
+        if mat and mat.node_tree:
+            ramp_node = mat.node_tree.nodes.get(node_name)
+            if ramp_node:
+                update_ramp_node(ramp_node)
     return None
 
 def update_material_properties(context):
@@ -1389,19 +1791,29 @@ def update_shrinkwrap_offset(context):
         if sw:
             sw.offset = props.shrinkwrap_offset
 
-def update_displacement(context):
-    props = context.scene.stroke_brush_properties
-    obj = context.object
-    if not obj or obj.type != 'CURVE' or not obj.data.materials:
+def update_displacement_values(self, context):
+    obj = context.active_object
+    if not obj or not obj.active_material or not obj.active_material.node_tree:
         return
-    mat = obj.data.materials[0]
-    if not mat or not mat.node_tree:
+    
+    mat_tree = obj.active_material.node_tree
+    for node in mat_tree.nodes:
+        if node.type == 'DISPLACEMENT':
+            node.inputs["Height"].default_value = self.displacement_height
+            node.inputs["Midlevel"].default_value = self.displacement_midlevel
+            node.inputs["Scale"].default_value = self.displacement_scale
+
+
+def update_normal_map_strength(self, context):
+    obj = context.active_object
+    if not obj or not obj.active_material or not obj.active_material.node_tree:
         return
-    disp = mat.node_tree.nodes.get("Displacement")
-    if disp:
-        disp.inputs["Height"].default_value = props.displacement_height
-        disp.inputs["Midlevel"].default_value = props.displacement_midlevel
-        disp.inputs["Scale"].default_value = props.displacement_scale
+
+    mat_tree = obj.active_material.node_tree
+    for node in mat_tree.nodes:
+        if node.type == 'NORMAL_MAP':
+            node.inputs['Strength'].default_value = self.normal_map_strength
+
 
 def update_solidify_modifier(self, context):
     obj = context.object
@@ -1421,7 +1833,6 @@ def update_solidify_modifier(self, context):
         if mod:
             obj.modifiers.remove(mod)
 
-# --- NEW: Wave Modifier Functions ---
 def update_wave_values(self, context):
     obj = context.active_object
     if not obj: return
@@ -1460,9 +1871,13 @@ class PAINTERLY_OT_ToggleWaveModifier(Operator):
             mod.speed = props.wave_speed
             mod.use_x = props.wave_motion_x
             mod.use_y = props.wave_motion_y
-            self.report({'INFO'}, "Wave modifier added.")
+            
+            # Move the modifier to the top of the stack
+            while obj.modifiers.find(mod.name) > 0:
+                bpy.ops.object.modifier_move_up(modifier=mod.name)
+
+            self.report({'INFO'}, "Wave modifier added and moved to top.")
         return {'FINISHED'}
-# --- End Wave Modifier ---
 
 def update_step_drivers(context):
     props = context.scene.stroke_brush_properties
@@ -1482,11 +1897,9 @@ def update_step_drivers(context):
                             except:
                                 continue
                             
-                            # --- ROBUST DRIVER EXPRESSION ---
-                            fcurve.driver.expression = f"int(((frame - 1) / step)) % max(fc, 1) + 1 == {index}"
+                            fcurve.driver.expression = f"int(((frame - 1) / max(step, 1))) % max(fc, 1) + 1 == {index}"
                             
                             driver = fcurve.driver
-                            # Re-establish variables to be safe
                             vars = {v.name: v for v in driver.variables}
                             if "frame" not in vars:
                                 vars["frame"] = driver.variables.new()
@@ -1526,21 +1939,21 @@ def update_alpha_channel(context):
             img_node_name = f"StrokeFrame_{idx}"
             img_node = node_tree.nodes.get(img_node_name)
             alpha_socket = node.inputs["Alpha"]
+            
+            links_to_remove = []
+            link_found = False
+            for link in node_tree.links:
+                if link.to_node == node and link.to_socket == alpha_socket:
+                    links_to_remove.append(link)
+                    link_found = True
+
             if props.use_alpha_channel:
-                link_found = False
-                for link in node_tree.links:
-                    if link.to_node == node and link.to_socket == alpha_socket:
-                        link_found = True
-                        break
                 if not link_found and img_node:
                     node_tree.links.new(img_node.outputs["Alpha"], alpha_socket)
             else:
-                links_to_remove = []
-                for link in node_tree.links:
-                    if link.to_node == node and link.to_socket == alpha_socket:
-                        links_to_remove.append(link)
                 for lnk in links_to_remove:
                     node_tree.links.remove(lnk)
+
 
 # ---------------------------
 # Tilt Control Integration (DEFINED BEFORE USAGE)
@@ -1595,8 +2008,6 @@ class StopMaintainingTiltOperator(Operator):
     bl_label  = "Stop Maintaining Tilt"
 
     def execute(self, context):
-        # This operator's purpose is to be a target for the UI,
-        # the actual stopping logic is in the modal operator.
         return {'FINISHED'}
 
 # ---------------------------
@@ -1686,13 +2097,12 @@ class StrokeBrushProperties(PropertyGroup):
         update=lambda s, c: update_alpha_channel(c)
     )
 
-    # Tilt Properties
     global_tilt: FloatProperty(
         name="Global Tilt",
         default=0.0,
         min=-3.14159,
         max=3.14159,
-        update=update_global_tilt # Direct function reference
+        update=update_global_tilt
     )
     maintain_tilt: BoolProperty(
         name="Maintain Tilt",
@@ -1707,10 +2117,8 @@ class StrokeBrushProperties(PropertyGroup):
     )
     def update_maintain_tilt(self, context):
         if self.maintain_tilt:
-            # FIX: Use 'INVOKE_DEFAULT' to properly start the modal operator
             bpy.ops.object.start_maintaining_tilt('INVOKE_DEFAULT')
         else:
-            # The modal operator stops itself when it sees the property is false.
             pass
 
     selected_object: PointerProperty(
@@ -1725,14 +2133,14 @@ class StrokeBrushProperties(PropertyGroup):
         update=lambda s, c: update_shrinkwrap_offset(c)
     )
     extrusion: FloatProperty(
-        name="Extrusion",
+        name="Size",
         default=0.1,
         min=0.0,
         max=10.0,
         update=lambda s, c: update_extrusion(c)
     )
     extrusion_locked: FloatProperty(
-        name="Extrusion (Locked)",
+        name="Size (Locked)",
         default=0.1,
         min=0.0,
         max=1.0,
@@ -1775,23 +2183,23 @@ class StrokeBrushProperties(PropertyGroup):
     displacement_height: FloatProperty(
         name="Height",
         default=0.0,
-        min=0.0,
+        min=-10.0,
         max=10.0,
-        update=lambda s, c: update_displacement(c)
+        update=update_displacement_values
     )
     displacement_midlevel: FloatProperty(
         name="Midlevel",
         default=0.0,
         min=0.0,
         max=1.0,
-        update=lambda s, c: update_displacement(c)
+        update=update_displacement_values
     )
     displacement_scale: FloatProperty(
         name="Scale",
         default=0.0,
         min=0.0,
         max=10.0,
-        update=lambda s, c: update_displacement(c)
+        update=update_displacement_values
     )
     add_subdivision: BoolProperty(
         name="Add Subdivision",
@@ -1808,7 +2216,6 @@ class StrokeBrushProperties(PropertyGroup):
         default=EFFECT_NONE,
         update=effect_update_callback
     )
-    # --- NEW: Wave Modifier Properties ---
     wave_height: FloatProperty(name="Height", default=0.2, min=0.0, max=10.0, update=update_wave_values)
     wave_width: FloatProperty(name="Width", default=0.44, min=0.0, max=10.0, update=update_wave_values)
     wave_narrowness: FloatProperty(name="Narrowness", default=10.0, min=0.1, max=20.0, update=update_wave_values)
@@ -1930,8 +2337,8 @@ class StrokeBrushProperties(PropertyGroup):
         description="Control the strength of the normal map for the stroke",
         default=0.4,
         min=0.0,
-        max=1.0,
-        update=lambda s, c: update_material_properties(c)
+        max=5.0,
+        update=update_normal_map_strength
     )
     subsurface_radius: FloatVectorProperty(
         name="Subsurface Radius",
@@ -1976,6 +2383,15 @@ class AddonProperties(PropertyGroup):
     latest_changelog: StringProperty(default="")
     latest_url: StringProperty(default="")
 
+class PresetSelectionItem(PropertyGroup):
+    name: StringProperty()
+    path: StringProperty()
+    selected: BoolProperty(name="", default=False)
+
+def update_include_stroke_pen_alphas(self, context):
+    """Callback to refresh the preset list when the option is toggled."""
+    sync_combined_preset_list(context)
+
 class PainterlyProperties(PropertyGroup):
     stroke_length: IntProperty(name="Stroke Length", default=1200, min=60, max=6000)
     stroke_width: FloatProperty(name="Stroke Width", default=90.0, min=30.0, max=300.0)
@@ -1984,7 +2400,7 @@ class PainterlyProperties(PropertyGroup):
     stroke_opacity: FloatProperty(name="Stroke Opacity", default=1.0, min=0.1, max=1.0)
     randomize_stroke_length: BoolProperty(name="Randomize Stroke Length", default=False)
     stroke_length_min: IntProperty(name="Min Stroke Length", default=300, min=60, max=6000)
-    image: PointerProperty(name="Image", type=bpy.types.Image)
+    
     batch_mode: BoolProperty(default=False)
     batch_folder: StringProperty(name="Batch Output Folder", subtype='DIR_PATH', default="")
     batch_amount: IntProperty(
@@ -1995,6 +2411,81 @@ class PainterlyProperties(PropertyGroup):
     )
     override_with_custom_image: BoolProperty(name="Override with Custom Image", default=False)
     override_image_path: StringProperty(name="Custom Image Path", subtype='FILE_PATH', default="")
+    resolution: EnumProperty(
+        name="Resolution",
+        description="Resolution of the baked image",
+        items=[
+            ('512', "512", "512x512"),
+            ('1024', "1024", "1024x1024"),
+            ('2048', "2048", "2048x2048"),
+            ('4096', "4096", "4096x4096"),
+            ('8192', "8192", "8192x8192"),
+        ],
+        default='1024'
+    )
+    process_all_materials: BoolProperty(
+        name="Process All Material Slots",
+        description="When enabled, 'Apply Painterly Effect' will process all materials on the object",
+        default=False
+    )
+    preserve_material_color: BoolProperty(
+        name="Preserve Material Color",
+        description="Reconnect the original material's color after applying the painterly effect",
+        default=True
+    )
+    dynamic_strokes: FloatProperty(
+        name="Dynamic Strokes",
+        description="Controls how much the normal map influences stroke angle, size, and randomness. 0=uniform, 1=max creativity",
+        default=0.2,
+        min=0.0,
+        max=1.0
+    )
+    average_stroke_size: FloatProperty(
+        name="Average Stroke Size",
+        description="Controls the overall average size of the generated strokes",
+        default=1.0,
+        min=0.01,
+        max=10.0
+    )
+    stroke_density: FloatProperty(
+        name="Stroke Density",
+        description="Controls the number of strokes generated. Higher values mean more strokes",
+        default=1.0,
+        min=0.01,
+        max=10.0
+    )
+    show_preset_list: BoolProperty(
+        name="List Presets",
+        description="Toggle between single preset selection and a list for selecting multiple packs",
+        default=False
+    )
+    include_stroke_pen_alphas: BoolProperty(
+        name="Include Stroke Pen Alphas",
+        description="Use brushes from the Stroke Pen mode in the Painterly Texture generator",
+        default=False,
+        update=update_include_stroke_pen_alphas
+    )
+    enable_color_pass: BoolProperty(
+        name="Enable Color Pass",
+        description="Process the material's Base Color texture with painterly strokes in addition to the normal map",
+        default=False
+    )
+    only_color_pass: BoolProperty(
+        name="Only Color Pass",
+        description="When enabled, only the color pass will be processed, skipping the normal pass",
+        default=False
+    )
+    preset_selections: CollectionProperty(type=PresetSelectionItem)
+
+class PAINTERLY_OT_SelectAllPresets(Operator):
+    bl_idname = "painterly.select_all_presets"
+    bl_label = "Select/Deselect All Presets"
+    select_all: BoolProperty()
+    def execute(self, context):
+        stylized_props = context.scene.stylized_painterly_properties
+        for item in stylized_props.preset_selections:
+            item.selected = self.select_all
+        return {'FINISHED'}
 
 class RefreshPreviewsOperator(bpy.types.Operator):
     """Reload thumbnails for the current page in each browser"""
@@ -2015,10 +2506,75 @@ class RefreshPreviewsOperator(bpy.types.Operator):
         self.report({'INFO'}, "Previews refreshed.")
         return {'FINISHED'}
 
+def scheduled_update_check():
+    """Wrapper function for the timer to prevent return value errors."""
+    bpy.ops.painterly.check_for_updates('INVOKE_DEFAULT')
+    return None
+
+@persistent
+def painterly_depsgraph_update_post(scene, depsgraph):
+    try:
+        if not scene or not scene.world:
+            return
+        geo_props = scene.geo_node_properties
+    except (ReferenceError, AttributeError):
+        return
+        
+    # --- START: Auto-cleanup for invalid secondary strokes ---
+    for ps_index, ps in enumerate(getattr(geo_props, "primary_strokes", [])):
+        if not _obj_alive(ps.obj): # Skip if the primary itself is invalid
+            continue
+
+        indices_to_remove = [i for i, ss in enumerate(ps.secondary_strokes) if not _obj_alive(ss.obj)]
+
+        if indices_to_remove:
+            mod = get_geo_node_modifier(ps.obj)
+            ng = mod.node_group if (mod and mod.node_group) else None
+
+            # Remove in reverse to not mess up indices
+            for i in sorted(indices_to_remove, reverse=True):
+                secondary_stroke = ps.secondary_strokes[i]
+                secondary_name_stored = secondary_stroke.name
+                socket_identifier = secondary_stroke.density_mask_socket_identifier
+
+                if ng:
+                    safe_secondary_name = _secondary_safe_name(secondary_name_stored)
+
+                    # Remove nodes
+                    nodes_to_remove = [n for n in ng.nodes if n.name.endswith(f"_{safe_secondary_name}")]
+                    for node in nodes_to_remove:
+                        ng.nodes.remove(node)
+
+                    # Remove interface socket
+                    if socket_identifier:
+                        socket_to_remove = next((item for item in ng.interface.items_tree if item.identifier == socket_identifier), None)
+                        if socket_to_remove:
+                            ng.interface.remove(socket_to_remove)
+                
+                # Finally remove the property group
+                ps.secondary_strokes.remove(i)
+                print(f"[Painterly] Auto-removed invalid instance '{secondary_name_stored}' from '{ps.obj.name}'.")
+    # --- END: Auto-cleanup ---
+        
+    for ps in getattr(geo_props, "primary_strokes", []):
+        obj = getattr(ps, "obj", None)
+        if not _obj_alive(obj):
+            continue
+        mod = get_geo_node_modifier(obj)
+        if not (mod and mod.node_group and obj.active_material):
+            continue
+        set_mat = mod.node_group.nodes.get("Painterly_Set_Material")
+        if set_mat:
+            if set_mat.inputs["Material"].default_value != obj.active_material:
+                set_mat.inputs["Material"].default_value = obj.active_material
+                _force_gn_refresh(obj)
+
 @persistent
 def painterly_load_post_handler(dummy):
     if painterly_frame_change_post not in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.append(painterly_frame_change_post)
+    if painterly_depsgraph_update_post not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(painterly_depsgraph_update_post)
         
     try:
         addon = bpy.context.preferences.addons.get(get_addon_key())
@@ -2031,7 +2587,7 @@ def painterly_load_post_handler(dummy):
         
         props = scn.painterly_folder_properties
         props.base_path = prefs.base_folder_path
-        props.folder_configured = bool(prefs.base_folder_path)
+        props.folder_configured = bool(props.base_path)
         
         if props.folder_configured:
             scan_painterly_folders(bpy.context)
@@ -2046,15 +2602,18 @@ def painterly_load_post_handler(dummy):
         addon_props.latest_changelog = ""
         addon_props.latest_url = ""
         if prefs.enable_auto_update:
-            bpy.app.timers.register(lambda: bpy.ops.painterly.check_for_updates(), first_interval=1)
+            bpy.app.timers.register(scheduled_update_check, first_interval=1)
+        
+        refresh_all_painterly_strokes(bpy.context)
 
-        # ——— MIGRATE any old‐version strokes so they aren’t “lost” ———
         for obj in bpy.context.scene.objects:
             if obj.type == 'CURVE':
                 data = obj.data
-                # old v2.x stored the stroke‐folder path on the Curve data itself
                 if hasattr(data, "get") and "painterly_stroke_path" in data and "painterly_stroke_path" not in obj:
                     obj["painterly_stroke_path"] = data["painterly_stroke_path"]
+
+        # Run the driver repair function to fix old files
+        _repair_painterly_drivers_after_update(scn)
 
     except Exception as exc:
         print("[Painterly] load_post handler failed:", exc)
@@ -2232,21 +2791,25 @@ class NavigateFolderOperator(Operator):
                 return (current_index - 1 + len(collection)) % len(collection)
     def execute(self, context):
         props = context.scene.painterly_folder_properties
+        
         if self.folder_type == 'stroke':
             props.current_stroke_index = self.navigate_collection(
                 props.current_stroke_index, props.stroke_folders, props.show_stroke_grid, props.previews_per_page
             )
             reinitialize_page_icons(props.stroke_folders, props.current_stroke_index, props.previews_per_page)
+
         elif self.folder_type == 'normal':
             props.current_normal_map_index = self.navigate_collection(
                 props.current_normal_map_index, props.normal_map_folders, props.show_normal_grid, props.previews_per_page
             )
             reinitialize_page_icons(props.normal_map_folders, props.current_normal_map_index, props.previews_per_page)
+        
         elif self.folder_type == 'preset':
             props.current_preset_index = self.navigate_collection(
                 props.current_preset_index, props.preset_folders, props.show_preset_grid, props.previews_per_page
             )
             reinitialize_page_icons(props.preset_folders, props.current_preset_index, props.previews_per_page)
+        
         return {'FINISHED'}
 
 class SelectPreviewOperator(Operator):
@@ -2297,18 +2860,14 @@ class AutoStrokeOperator(Operator):
             stroke_name = stroke_folder.name.replace(" ", "_")
             base_obj_name = f"Painterly_{stroke_name}"
             
-            # --- FIX INTEGRATED HERE ---
-            # Proper deferred curve creation (then kill the default segment)
             bpy.ops.curve.primitive_bezier_curve_add(enter_editmode=False, align='WORLD', location=(0,0,0))
             new_curve = context.active_object
             new_curve.name = base_obj_name
             curve_data = new_curve.data
             curve_data.name = base_obj_name + "_Curve"
-            # remove the initial prefab spline so nothing shows until you draw
-            # (this empties the curve, your modal draw will add new splines)
+
             while curve_data.splines:
                 curve_data.splines.remove(curve_data.splines[0])
-            # --- END OF FIX INTEGRATION ---
             
             new_curve['painterly_stroke_path'] = stroke_folder.path
 
@@ -2421,14 +2980,13 @@ class AutoStrokeOperator(Operator):
                 mix_nodes = []
                 mix_prev = nodes.new("ShaderNodeMixShader")
                 mix_prev.parent = mix_shader_frame
-                mix_prev.name = "Mix Shader_1" # Underscore to help parsing
+                mix_prev.name = "Mix Shader_1"
                 mix_prev.location = (-400, 400)
                 links.new(transp.outputs["BSDF"], mix_prev.inputs[1])
                 links.new(base_nodes[0].outputs["BSDF"], mix_prev.inputs[2])
                 drv = mix_prev.inputs[0].driver_add("default_value").driver
                 
-                # --- ROBUST DRIVER EXPRESSION ---
-                drv.expression = "int(((frame - 1) / step)) % max(fc, 1) + 1 == 1"
+                drv.expression = "int(((frame - 1) / max(step, 1))) % max(fc, 1) + 1 == 1"
                 
                 driver = drv
                 vars = {v.name: v for v in driver.variables}
@@ -2458,14 +3016,13 @@ class AutoStrokeOperator(Operator):
                 for i in range(1, frame_count):
                     mix_node = nodes.new("ShaderNodeMixShader")
                     mix_node.parent = mix_shader_frame
-                    mix_node.name = f"Mix Shader_{i+1}" # Underscore to help parsing
+                    mix_node.name = f"Mix Shader_{i+1}"
                     mix_node.location = (-400, 400 - i * 200)
                     links.new(mix_nodes[-1].outputs["Shader"], mix_node.inputs[1])
                     links.new(base_nodes[i].outputs["BSDF"], mix_node.inputs[2])
                     drv = mix_node.inputs[0].driver_add("default_value").driver
 
-                    # --- ROBUST DRIVER EXPRESSION ---
-                    drv.expression = f"int(((frame - 1) / step)) % max(fc, 1) + 1 == {i+1}"
+                    drv.expression = f"int(((frame - 1) / max(step, 1))) % max(fc, 1) + 1 == {i+1}"
                     
                     driver = drv
                     vars = {v.name: v for v in driver.variables}
@@ -2569,7 +3126,7 @@ class AutoStrokeOperator(Operator):
                 normal_img_node.location = (-1200, 0)
                 normal_map_node = nodes.new("ShaderNodeNormalMap")
                 normal_map_node.parent = normal_map_frame
-                normal_map_node.name = "Normal Map_1" # Underscore to help parsing
+                normal_map_node.name = "Normal Map_1"
                 normal_map_node.location = (-900, 0)
                 links.new(normal_img_node.outputs["Color"], normal_map_node.inputs["Color"])
                 normal_map_node.space = 'OBJECT'
@@ -2622,24 +3179,45 @@ class AutoBakeOperator(Operator):
             bpy.context.scene.render.engine = 'CYCLES'
             bpy.ops.object.mode_set(mode='OBJECT')
             mat = obj.active_material or bpy.data.materials.new(name="PainterlyMaterial")
+            if not obj.active_material:
+                obj.data.materials.append(mat)
             obj.active_material = mat
             mat.use_nodes = True
             nds = mat.node_tree.nodes
             lnks = mat.node_tree.links
-            bsdf = nds.get("Principled BSDF") or nds.new("ShaderNodeBsdfPrincipled")
+            bsdf = next((n for n in nds if n.type == 'BSDF_PRINCIPLED'), None)
+            if not bsdf:
+                bsdf = nds.new("ShaderNodeBsdfPrincipled")
+
             tex_image = nds.new('ShaderNodeTexImage')
             image_name = f"{obj.name}_NORM_MAP"
+            
+            res = int(stylized_props.resolution)
+
             if image_name in bpy.data.images:
                 image = bpy.data.images[image_name]
+                image.scale(res, res)
             else:
-                image = bpy.data.images.new(name=image_name, width=1024, height=1024)
+                image = bpy.data.images.new(name=image_name, width=res, height=res, alpha=True)
+                
             tex_image.image = image
+            
+            for link in bsdf.inputs['Base Color'].links:
+                lnks.remove(link)
             lnks.new(bsdf.inputs['Base Color'], tex_image.outputs['Color'])
+            
             normal_map_node = nds.new('ShaderNodeNormalMap')
             normal_map_node.space = 'OBJECT'
             normal_map_node.inputs['Strength'].default_value = 0.4
+            
+            for link in normal_map_node.inputs['Color'].links:
+                lnks.remove(link)
             lnks.new(normal_map_node.inputs['Color'], tex_image.outputs['Color'])
+            
+            for link in bsdf.inputs['Normal'].links:
+                lnks.remove(link)
             lnks.new(bsdf.inputs['Normal'], normal_map_node.outputs['Normal'])
+
             scn = bpy.context.scene
             scn.render.bake.use_selected_to_active = False
             scn.render.bake.margin = 3
@@ -2647,7 +3225,10 @@ class AutoBakeOperator(Operator):
             scn.cycles.bake_type = 'NORMAL'
             scn.render.bake.normal_space = 'OBJECT'
             mat.node_tree.nodes.active = tex_image
+            
+            self.report({'INFO'}, f"Baking to {res}x{res} image. This may take a moment...")
             bpy.ops.object.bake(type='NORMAL')
+            
             self.report({'INFO'}, "Baking completed successfully")
             stylized_props.image = image
             image.pack()
@@ -2656,234 +3237,518 @@ class AutoBakeOperator(Operator):
             self.report({'ERROR'}, f"Baking failed: {e}")
             return {'CANCELLED'}
 
+class PAINTERLY_OT_CancelEffect(Operator):
+    bl_idname = "painterly.cancel_effect"
+    bl_label = "Cancel Painterly Process"
+    bl_description = "Stops the ongoing Painterly texture generation"
+
+    def execute(self, context):
+        context.window_manager.painterly_cancel_requested = True
+        self.report({'INFO'}, "Cancellation requested.")
+        return {'FINISHED'}
+
 class PainterlyEffectOperator(Operator):
     bl_idname = "texture.apply_painterly_effect"
     bl_label = "Apply Painterly Effect"
     bl_options = {'REGISTER', 'UNDO'}
-    def execute(self, context):
-        if not check_pillow():
-            self.report({'ERROR'}, "PIL not installed. Please click the 'Install Dependencies (PIL)' button below.")
+
+    _timer = None
+    _executor = None
+    _futures = None
+    _stroke_tasks = None
+    _loaded_brushes = None
+    
+    # Cache for resized brushes
+    _brush_cache = {}
+
+    materials_to_process = []
+    current_material_index = 0
+    current_pass: StringProperty(default='NORMAL')
+    
+    _original_color_connections = {}
+    _source_color_images = {}
+    _source_normal_images = {}
+
+    def _cleanup(self, context, cancelled=False):
+        """Safely clean up modal resources."""
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+        if self._executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+        self._futures = None
+        self._brush_cache.clear() # Clear cache on cleanup
+        
+        context.window_manager.progress_end()
+        if cancelled:
+            self.report({'INFO'}, "Painterly process cancelled.")
+        else:
+            self.report({'INFO'}, "Painterly process finished.")
+        
+        context.window_manager.painterly_is_processing = False
+
+    def modal(self, context, event):
+        if context.window_manager.painterly_cancel_requested:
+            self._cleanup(context, cancelled=True)
             return {'CANCELLED'}
+
+        if event.type == 'ESC':
+            self._cleanup(context, cancelled=True)
+            return {'CANCELLED'}
+
+        if event.type == 'TIMER':
+            if not self._executor or not self._futures:
+                self._cleanup(context)
+                return {'FINISHED'}
+            
+            done_count = sum(1 for f in self._futures if f.done())
+            
+            current_mat_name = self.materials_to_process[self.current_material_index].name
+            progress_msg = f"Painterly: Processing '{current_mat_name}' - {self.current_pass} Pass ({done_count}/{len(self._futures)})"
+            context.workspace.status_text_set(progress_msg)
+            context.window_manager.painterly_progress_text = f"{self.current_pass} ({done_count}/{len(self._futures)})"
+            
+            if done_count == len(self._futures):
+                mat_to_process = self.materials_to_process[self.current_material_index]
+                self.finalize_tile(context, mat_to_process)
+                self._advance_state(context)
+                if self.current_material_index >= len(self.materials_to_process):
+                    self._cleanup(context)
+                    return {'FINISHED'}
+                else:
+                    self.setup_for_next_job(context)
+
+        return {'PASS_THROUGH'}
+
+    def _advance_state(self, context):
+        stylized_props = context.scene.stylized_painterly_properties
+        current_mat = self.materials_to_process[self.current_material_index]
+        
+        if self.current_pass == 'COLOR' and not stylized_props.only_color_pass:
+            self.current_pass = 'NORMAL'
+        else:
+            self.finalize_node_setup(context, current_mat)
+            self.current_material_index += 1
+            if self.current_material_index < len(self.materials_to_process):
+                self.current_pass = 'COLOR' if stylized_props.enable_color_pass else 'NORMAL'
+    
+    def invoke(self, context, event):
+        if not check_pillow():
+            self.report({'ERROR'}, "Pillow library not installed. Please install it in Add-on Preferences.")
+            return {'CANCELLED'}
+        
+        context.window_manager.painterly_is_processing = True
+        context.window_manager.painterly_cancel_requested = False
+            
         scene = context.scene
         stylized_props = scene.stylized_painterly_properties
         folder_props = scene.painterly_folder_properties
-        obj = context.active_object
-        if obj.active_material is None or stylized_props.image is None:
-            bpy.ops.texture.auto_bake()
-        if not stylized_props.image:
-            self.report({'ERROR'}, "Auto Bake failed; cannot apply Painterly Effect.")
+        
+        obj_ref = context.active_object
+        if not obj_ref:
+            self.report({'ERROR'}, "No active object selected.")
+            context.window_manager.painterly_is_processing = False
             return {'CANCELLED'}
-        final_image = stylized_props.image
-        if len(folder_props.preset_folders) == 0:
-            self.report({'ERROR'}, "No preset folders available.")
-            return {'CANCELLED'}
-        current_preset = folder_props.preset_folders[folder_props.current_preset_index]
-        brush_stroke_path = current_preset.path
-        brush_stroke_images = [os.path.join(brush_stroke_path, f)
-                               for f in os.listdir(brush_stroke_path)
-                               if f.lower().endswith('.png')]
-        if not brush_stroke_images:
-            self.report({'ERROR'}, "No brush stroke images found in the selected preset.")
-            return {'CANCELLED'}
-        if stylized_props.batch_mode:
-            if not stylized_props.batch_folder or not os.path.exists(stylized_props.batch_folder):
-                self.report({'ERROR'}, "Please select a valid batch folder.")
-                return {'CANCELLED'}
-            for i in range(stylized_props.batch_amount):
-                seed = stylized_props.random_seed
-                success, out_image = self.run_painterly_once(
-                    context.active_object, stylized_props, brush_stroke_images,
-                    override_path=None, random_seed=seed
-                )
-                if not success:
-                    return {'CANCELLED'}
-                obj = context.active_object
-                out_name = f"{obj.name}_PAINTERLY_{i+1}.png"
-                out_path = os.path.join(stylized_props.batch_folder, out_name)
-                out_image.filepath_raw = out_path
-                out_image.file_format = 'PNG'
-                out_image.save()
-            self.report({'INFO'}, f"Batch completed. {stylized_props.batch_amount} images saved.")
-            return {'FINISHED'}
+            
+        self.materials_to_process.clear()
+        self._original_color_connections.clear()
+        self._source_color_images.clear()
+        self._source_normal_images.clear()
+        
+        if not obj_ref.material_slots:
+            self.report({'INFO'}, "Object has no materials. Creating a new one.")
+            new_mat = bpy.data.materials.new(name=f"{obj_ref.name}_PainterlyMat")
+            new_mat.use_nodes = True
+            obj_ref.data.materials.append(new_mat)
+        
+        if stylized_props.process_all_materials:
+            self.materials_to_process = [slot.material for slot in obj_ref.material_slots if slot.material]
         else:
-            seed = stylized_props.random_seed
-            success, out_image = self.run_painterly_once(
-                context.active_object, stylized_props, brush_stroke_images,
-                override_path=None, random_seed=seed
-            )
-            if not success:
-                return {'CANCELLED'}
-            self.report({'INFO'}, "Painterly effect applied successfully.")
-            return {'FINISHED'}
-    def run_painterly_once(self, obj, stylized_props, brush_stroke_images, override_path=None, random_seed=42):
-        try:
-            from PIL import Image, ImageFilter
-        except ImportError:
-            self.report({'ERROR'}, "PIL not installed or not found.")
-            return False, None
-        if override_path:
-            try:
-                external_pil = Image.open(override_path).convert("RGBA")
-                w, h = external_pil.size
-                data = np.array(external_pil).astype(np.float32) / 255.0
-                data_flat = data.flatten()
-                override_img_name = "OVERRIDE_IMAGE"
-                if override_img_name in bpy.data.images:
-                    old_img = bpy.data.images[override_img_name]
-                    bpy.data.images.remove(old_img)
-                blender_override_img = bpy.data.images.new(override_img_name, width=w, height=h)
-                blender_override_img.pixels = data_flat
-                final_image = blender_override_img
-            except Exception as e:
-                self.report({'ERROR'}, f"Failed to load override image: {e}")
-                return False, None
-        else:
-            final_image = stylized_props.image
-            if not final_image:
-                return False, None
-        success, out_image = self.apply_painterly_effect_generic(
-            obj, final_image, brush_stroke_images,
-            stylized_props.stroke_length, stylized_props.stroke_width,
-            random_seed, stylized_props.randomness_intensity, True,
-            stylized_props.stroke_opacity,
-            stylized_props.randomize_stroke_length,
-            stylized_props.stroke_length_min
-        )
-        return success, out_image
-    def apply_painterly_effect_generic(self, obj, image, brush_stroke_images,
-                                       stroke_length, stroke_width, random_seed,
-                                       randomness_intensity, color_variation,
-                                       stroke_opacity, randomize_stroke_length,
-                                       stroke_length_min):
-        try:
-            from PIL import Image, ImageFilter
-        except ImportError:
-            self.report({'ERROR'}, "PIL not installed.")
-            return False, None
-        import random
-        random.seed(random_seed)
-        w, h = image.size
-        data = np.array(image.pixels[:]).reshape(h, w, 4) * 255
-        base_pil = Image.fromarray(data.astype(np.uint8), 'RGBA')
-        painterly_img = Image.new("RGBA", (w, h), (255, 255, 255, 0))
-        if base_pil.mode == "RGBA":
-            gray_base = base_pil.convert("L")
-            edges = gray_base.filter(ImageFilter.FIND_EDGES)
-            edge_map = np.array(edges)
-        else:
-            edge_map = None
-        loaded_brushes = []
-        for p in brush_stroke_images:
-            try:
-                b_img = Image.open(p).convert("RGBA")
-                loaded_brushes.append(b_img)
-            except:
-                continue
-        if not loaded_brushes:
-            self.report({'ERROR'}, "No valid brush strokes found.")
-            return False, None
-        factor = 500.0 / 9.0
-        overbleed = 10
-        num_strokes = int(randomness_intensity * w * h / factor)
-        small_base = 0.05 * stroke_length
-        big_base = small_base * 5.0
-        stroke_width_scaled = stroke_width * 0.5
-        skip_non_edge_prob = 0.3
-        skip_edge_prob = 0.2
-        EDGE_THRESHOLD = 40
-        tasks = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=None) as executor:
-            for _ in range(num_strokes):
-                x = random.randint(overbleed, w - overbleed)
-                y = random.randint(overbleed, h - overbleed)
-                px = base_pil.getpixel((x, y))
-                if px[0] < 10 and px[1] < 10 and px[2] < 10:
-                    continue
-                if px[3] == 0:
-                    continue
-                angle = random.uniform(0, 360)
-                chosen_length = float(stroke_length)
-                if randomize_stroke_length:
-                    chosen_length = random.uniform(stroke_length_min, stroke_length)
-                if edge_map is not None:
-                    ed_val = edge_map[y, x]
-                    if ed_val > EDGE_THRESHOLD:
-                        length_val = random.uniform(0.8, 1.2) * small_base
-                        if random.random() < skip_edge_prob:
-                            continue
-                    else:
-                        length_val = random.uniform(0.8, 1.2) * big_base
-                        if random.random() < skip_non_edge_prob:
-                            continue
-                    chosen_length = length_val
-                chosen_brush = random.choice(loaded_brushes)
-                tasks.append(executor.submit(
-                    self.apply_stroke_simple,
-                    painterly_img, chosen_brush,
-                    x, y, angle, chosen_length,
-                    stroke_width_scaled, stroke_opacity,
-                    color_variation, px
-                ))
-            concurrent.futures.wait(tasks)
-        combined = np.array(painterly_img).flatten() / 255.0
-        paint_name = f"{obj.active_material.name}_PAINTERLY"
-        if paint_name in bpy.data.images:
-            old = bpy.data.images[paint_name]
-            bpy.data.images.remove(old)
-        blender_res = bpy.data.images.new(paint_name, width=w, height=h)
-        blender_res.pixels = combined
-        blender_res.pack()
-        mat = obj.active_material or bpy.data.materials.new(name="PainterlyMaterial")
-        obj.active_material = mat
-        mat.use_nodes = True
-        nds = mat.node_tree.nodes
-        lnks = mat.node_tree.links
-        bsdf = nds.get("Principled BSDF") or nds.new("ShaderNodeBsdfPrincipled")
-        tex_img = nds.new('ShaderNodeTexImage')
-        tex_img.image = blender_res
-        tex_img.image.colorspace_settings.name = 'Non-Color'
-        lnks.new(bsdf.inputs['Base Color'], tex_img.outputs['Color'])
-        lnks.new(bsdf.inputs['Alpha'], tex_img.outputs['Alpha'])
-        normal_map_node = nds.new('ShaderNodeNormalMap')
-        normal_map_node.space = 'OBJECT'
-        normal_map_node.inputs['Strength'].default_value = 0.4
-        lnks.new(normal_map_node.inputs['Color'], tex_img.outputs['Color'])
-        lnks.new(bsdf.inputs['Normal'], normal_map_node.outputs['Normal'])
-        return True, blender_res
+            if obj_ref.active_material:
+                self.materials_to_process.append(obj_ref.active_material)
 
-    def apply_stroke_simple(self, painterly_image, brush_stroke,
-                            x, y, angle, length,
-                            stroke_width, stroke_opacity,
-                            color_variation, base_color):
-        from PIL import Image
-        try:
-            import random
-            brush_resized = brush_stroke.resize((int(stroke_width), int(stroke_width)), Image.LANCZOS)
-            brush_rotated = brush_resized.rotate(angle, expand=True)
-            if color_variation:
-                c_r = base_color[0] + random.randint(-30, 30)
-                c_g = base_color[1] + random.randint(-30, 30)
-                c_b = base_color[2] + random.randint(-30, 30)
-                color = ( int(max(0, min(255, c_r))),
-                          int(max(0, min(255, c_g))),
-                          int(max(0, min(255, c_b))),
-                          int(stroke_opacity * 255) )
+        if not self.materials_to_process:
+            self.report({'ERROR'}, "No materials to process. Assign a material or use 'Process All'.")
+            context.window_manager.painterly_is_processing = False
+            return {'CANCELLED'}
+        
+        for mat in self.materials_to_process:
+            if not mat.use_nodes: mat.use_nodes = True
+            if mat.node_tree is None: continue
+
+            bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            if bsdf:
+                if bsdf.inputs['Base Color'].is_linked:
+                    from_node = bsdf.inputs['Base Color'].links[0].from_node
+                    if from_node.type == 'TEX_IMAGE' and from_node.image:
+                        self._source_color_images[mat.name] = from_node.image
+                
+                if bsdf.inputs['Normal'].is_linked:
+                    from_node = bsdf.inputs['Normal'].links[0].from_node
+                    if from_node.type == 'NORMAL_MAP' and from_node.inputs['Color'].is_linked:
+                        from_node_2 = from_node.inputs['Color'].links[0].from_node
+                        if from_node_2.type == 'TEX_IMAGE' and from_node_2.image:
+                            self._source_normal_images[mat.name] = from_node_2.image
+
+            if stylized_props.enable_color_pass and mat.name not in self._source_color_images:
+                 self.report({'WARNING'}, f"Material '{mat.name}' has no Image Texture for Color Pass. Skipping Color Pass.")
+            
+            if not stylized_props.only_color_pass and mat.name not in self._source_normal_images:
+                self.report({'INFO'}, f"Material '{mat.name}' has no source normal map. Auto-baking...")
+                context.view_layer.objects.active = obj_ref
+                obj_ref.active_material_index = obj_ref.material_slots.find(mat.name)
+                bpy.ops.texture.auto_bake('EXEC_DEFAULT')
+                self._source_normal_images[mat.name] = bpy.data.images.get(f"{obj_ref.name}_NORM_MAP")
+
+        self._loaded_brushes = []
+        selected_presets = []
+        if stylized_props.show_preset_list:
+            selected_presets = [p for p in stylized_props.preset_selections if p.selected]
+        else:
+            if stylized_props.include_stroke_pen_alphas:
+                if folder_props.stroke_folders:
+                    selected_presets = [folder_props.stroke_folders[folder_props.current_stroke_index]]
             else:
-                color = (base_color[0], base_color[1], base_color[2], int(stroke_opacity * 255))
-            mask = brush_rotated.split()[3]
-            colored = Image.new("RGBA", brush_rotated.size)
-            for i in range(colored.size[0]):
-                for j in range(colored.size[1]):
-                    p = brush_rotated.getpixel((i, j))
-                    if p[3] > 0:
-                        colored.putpixel((i, j), color)
-            off_x = int(x - colored.size[0] * 0.5)
-            off_y = int(y - colored.size[1] * 0.5)
-            base_crop = painterly_image.crop((off_x, off_y, off_x + colored.size[0], off_y + colored.size[1]))
-            base_crop = Image.alpha_composite(base_crop, colored)
-            painterly_image.paste(base_crop, (off_x, off_y), mask)
-        except Exception as ex:
-            print("Error applying stroke in thread:", ex)
+                if folder_props.preset_folders:
+                    selected_presets = [folder_props.preset_folders[folder_props.current_preset_index]]
+
+        if not selected_presets:
+            self.report({'ERROR'}, "No preset folders selected. Please select at least one preset.")
+            context.window_manager.painterly_is_processing = False
+            return {'CANCELLED'}
+
+        for preset in selected_presets:
+            if os.path.isdir(preset.path):
+                try:
+                    from PIL import Image
+                    for dirpath, _, filenames in os.walk(preset.path):
+                        for f in filenames:
+                            if f.lower().endswith('.png'):
+                                full_path = os.path.join(dirpath, f)
+                                self._loaded_brushes.append(Image.open(full_path).convert("RGBA"))
+                except Exception as e:
+                    self.report({'ERROR'}, f"Failed to load brushes from '{preset.name}': {e}")
+                    context.window_manager.painterly_is_processing = False
+                    return {'CANCELLED'}
+
+        if not self._loaded_brushes:
+            self.report({'ERROR'}, "Selected preset folders contain no valid .png brushes.")
+            context.window_manager.painterly_is_processing = False
+            return {'CANCELLED'}
+
+        self.current_material_index = 0
+        self.current_pass = 'COLOR' if stylized_props.enable_color_pass else 'NORMAL'
+        
+        self.setup_for_next_job(context)
+
+        context.window_manager.progress_begin(0, 100)
+        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        self.report({'INFO'}, f"Starting Painterly process on {len(self.materials_to_process)} material(s)...")
+        return {'RUNNING_MODAL'}
+
+    def setup_for_next_job(self, context):
+        from PIL import Image
+        stylized_props = context.scene.stylized_painterly_properties
+        current_mat = self.materials_to_process[self.current_material_index]
+
+        source_image = None
+        color_pil = None
+        normal_pil = None
+        
+        source_normal_image = self._source_normal_images.get(current_mat.name)
+        if source_normal_image:
+            try:
+                norm_w, norm_h = source_normal_image.size
+                norm_pixels = np.array(source_normal_image.pixels[:]).reshape(norm_h, norm_w, 4) * 255
+                normal_pil = Image.fromarray(norm_pixels.astype(np.uint8), 'RGBA')
+            except (ValueError, IndexError) as e:
+                self.report({'ERROR'}, f"Could not process normal map for '{current_mat.name}': {e}. Check dimensions.")
+                self._advance_state(context)
+                if self.current_material_index < len(self.materials_to_process): self.setup_for_next_job(context)
+                return
+        
+        if self.current_pass == 'COLOR':
+            source_image = self._source_color_images.get(current_mat.name)
+            if not source_image or not normal_pil:
+                self._advance_state(context)
+                if self.current_material_index < len(self.materials_to_process): self.setup_for_next_job(context)
+                return
+            
+            w, h = source_image.size
+            pixels = np.array(source_image.pixels[:]).reshape(h, w, 4) * 255
+            color_pil = Image.fromarray(pixels.astype(np.uint8), 'RGBA')
+            
+            if (w,h) != normal_pil.size:
+                self.report({'WARNING'}, f"Color and Normal map dimensions differ for '{current_mat.name}'. Resizing normal map for this pass.")
+                normal_pil = normal_pil.resize((w,h), Image.Resampling.LANCZOS)
+        else:
+            source_image = source_normal_image
+
+        if not source_image:
+             self._advance_state(context)
+             if self.current_material_index < len(self.materials_to_process): self.setup_for_next_job(context)
+             return
+        
+        self._stroke_tasks = self.generate_stroke_tasks(normal_pil, color_pil, stylized_props, context, current_mat.name)
+        
+        if not self._stroke_tasks:
+            self._futures = []
+            self._advance_state(context)
+            if self.current_material_index < len(self.materials_to_process): self.setup_for_next_job(context)
+            return
+
+        self._executor = concurrent.futures.ThreadPoolExecutor()
+        self._futures = [
+            self._executor.submit(
+                self.apply_stroke_thread,
+                task['brush'], task['pos'], task['angle'], task['length'],
+                task['width'], task['opacity'], task['color'], self._brush_cache
+            ) for task in self._stroke_tasks
+        ]
+
+    def finalize_tile(self, context, material):
+        from PIL import Image
+        
+        w,h = (0,0)
+        source_img = None
+        if self.current_pass == 'COLOR':
+            source_img = self._source_color_images.get(material.name)
+        else:
+            source_img = self._source_normal_images.get(material.name)
+        
+        if not source_img: return
+        w, h = source_img.size
+
+        painterly_img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+        for future in self._futures:
+            if context.window_manager.painterly_cancel_requested: break
+            try:
+                stroke_img, position = future.result()
+                if stroke_img:
+                    painterly_img.paste(stroke_img, position, mask=stroke_img)
+            except Exception as e:
+                print(f"A stroke failed to apply: {e}")
+        
+        pass_name = "COLOR" if self.current_pass == "COLOR" else "NORMAL"
+        paint_name = f"{material.name}_PAINTERLY_{pass_name}"
+        
+        if paint_name in bpy.data.images:
+            blender_res = bpy.data.images[paint_name]
+            if blender_res.size[0] != w or blender_res.size[1] != h:
+                blender_res.scale(w,h)
+        else:
+            blender_res = bpy.data.images.new(paint_name, width=w, height=h, alpha=True)
+
+        if self.current_pass == "COLOR":
+            blender_res.alpha_mode = 'NONE'
+
+        pixels_flat = (np.array(painterly_img).flatten() / 255.0).astype(np.float32)
+        blender_res.pixels.foreach_set(pixels_flat)
+        blender_res.pack()
+
+    def finalize_node_setup(self, context, material):
+        stylized_props = context.scene.stylized_painterly_properties
+        stroke_props = context.scene.stroke_brush_properties
+
+        nds = material.node_tree.nodes
+        lnks = material.node_tree.links
+
+        for node in list(nds):
+            if node.name.startswith("Painterly_"):
+                nds.remove(node)
+
+        bsdf = next((n for n in nds if n.type == 'BSDF_PRINCIPLED'), None)
+        if not bsdf: return 
+
+        normal_tex_name = f"{material.name}_PAINTERLY_NORMAL"
+        if normal_tex_name in bpy.data.images:
+            normal_tex_img = nds.new('ShaderNodeTexImage')
+            normal_tex_img.name = "Painterly_Normal_Texture"
+            normal_tex_img.image = bpy.data.images[normal_tex_name]
+            normal_tex_img.image.colorspace_settings.name = 'Non-Color'
+            normal_tex_img.location = (bsdf.location.x - 500, bsdf.location.y - 200)
+
+            normal_map_node = nds.new('ShaderNodeNormalMap')
+            normal_map_node.name = "Painterly_Normal_Map"
+            normal_map_node.space = 'OBJECT'
+            normal_map_node.inputs['Strength'].default_value = stroke_props.normal_map_strength
+            normal_map_node.location = (bsdf.location.x - 250, bsdf.location.y - 200)
+            
+            disp_node = nds.new("ShaderNodeDisplacement")
+            disp_node.name = "Painterly_Displacement"
+            disp_node.location = (bsdf.location.x - 250, bsdf.location.y - 400)
+            disp_node.inputs["Height"].default_value = stroke_props.displacement_height
+            disp_node.inputs["Midlevel"].default_value = stroke_props.displacement_midlevel
+            disp_node.inputs["Scale"].default_value = stroke_props.displacement_scale
+
+            lnks.new(normal_tex_img.outputs['Color'], normal_map_node.inputs['Color'])
+            lnks.new(normal_map_node.outputs['Normal'], bsdf.inputs['Normal'])
+
+            mat_out = next((n for n in nds if n.type == 'OUTPUT_MATERIAL'), None)
+            if mat_out:
+                lnks.new(normal_map_node.outputs['Normal'], disp_node.inputs['Normal'])
+                lnks.new(disp_node.outputs['Displacement'], mat_out.inputs['Displacement'])
+
+        color_tex_name = f"{material.name}_PAINTERLY_COLOR"
+        if color_tex_name in bpy.data.images:
+            color_tex_img = nds.new('ShaderNodeTexImage')
+            color_tex_img.name = "Painterly_Color_Texture"
+            color_tex_img.image = bpy.data.images[color_tex_name]
+            color_tex_img.image.colorspace_settings.name = 'sRGB'
+            color_tex_img.location = (bsdf.location.x - 500, bsdf.location.y)
+            lnks.new(color_tex_img.outputs['Color'], bsdf.inputs['Base Color'])
+        elif stylized_props.preserve_material_color:
+             original_socket = self._original_color_connections.get(material.name)
+             if original_socket:
+                 lnks.new(original_socket, bsdf.inputs['Base Color'])
+        else:
+            if normal_tex_name in bpy.data.images:
+                lnks.new(nds["Painterly_Normal_Texture"].outputs['Color'], bsdf.inputs['Base Color'])
+
+
+    def generate_stroke_tasks(self, normal_pil, color_pil, props, context, material_name):
+        from PIL import Image, ImageDraw, ImageFilter
+        import math
+        import numpy
+
+        tasks = []
+        random.seed(props.random_seed)
+        w, h = normal_pil.size
+
+        if w == 0 or h == 0:
+            return []
+
+        try:
+            alpha = normal_pil.getchannel('A')
+            mask = Image.new('L', (w, h), 0)
+            mask.paste(alpha)
+        except ValueError:
+            mask = Image.new('L', (w, h), 255)
+
+        gray_pil = normal_pil.convert('L')
+        edge_map_img = gray_pil.filter(ImageFilter.FIND_EDGES)
+        edge_data = np.array(edge_map_img)
+
+        factor = 500.0 / 9.0
+        num_strokes = int(props.randomness_intensity * w * h / factor * props.stroke_density)
+
+        for _ in range(num_strokes):
+            if context.window_manager.painterly_cancel_requested:
+                break
+
+            x = random.randint(0, w - 1)
+            y = random.randint(0, h - 1)
+
+            if mask.getpixel((x, y)) < 10:
+                continue
+
+            px_normal = normal_pil.getpixel((x, y))
+            if px_normal[0] < 10 and px_normal[1] < 10 and px_normal[2] < 10:
+                continue
+
+            dynamic_factor = props.dynamic_strokes
+            
+            x_comp = (px_normal[0] / 255.0) * 2.0 - 1.0
+            y_comp = (px_normal[1] / 255.0) * 2.0 - 1.0
+            base_angle_rad = math.atan2(y_comp, x_comp)
+            base_angle_deg = math.degrees(base_angle_rad)
+            angle_randomness = (random.random() * 2 - 1) * 90 * dynamic_factor
+            final_angle = base_angle_deg + angle_randomness
+
+            final_width = 0
+            final_length = 0
+
+            if random.random() < (0.15 * dynamic_factor):
+                size_boost = 1.5 + (2.5 * dynamic_factor * random.random())
+                elongation_boost = 1.5 + (2.0 * dynamic_factor * random.random())
+                final_width = (props.stroke_width * props.average_stroke_size) * size_boost
+                final_length = final_width * elongation_boost
+            else:
+                edge_strength = edge_data[y, x] / 255.0
+                open_space_factor = 1.0 - edge_strength
+                base_width = props.stroke_width * props.average_stroke_size
+                edge_scale_modifier = (open_space_factor * 0.9) + 0.1
+                size_modifier = 1.0 - (1.0 - edge_scale_modifier) * dynamic_factor
+                final_width = base_width * size_modifier
+                elongation_factor = 1.0 + (open_space_factor * 2.0 * dynamic_factor)
+                final_length = final_width * elongation_factor
+            
+            final_color = (0,0,0,0)
+            if color_pil:
+                px_color = color_pil.getpixel((x, y))
+                final_color = (
+                    px_color[0], px_color[1], px_color[2], 
+                    int(props.stroke_opacity * 255)
+                )
+            else:
+                c_r = px_normal[0] + random.randint(-20, 20)
+                c_g = px_normal[1] + random.randint(-20, 20)
+                c_b = px_normal[2] + random.randint(-20, 20)
+                final_color = (
+                    int(max(0, min(255, c_r))),
+                    int(max(0, min(255, c_g))),
+                    int(max(0, min(255, c_b))),
+                    int(props.stroke_opacity * 255)
+                )
+
+            tasks.append({
+                'brush': random.choice(self._loaded_brushes),
+                'pos': (x, y),
+                'angle': final_angle,
+                'length': final_length,
+                'width': final_width,
+                'opacity': props.stroke_opacity,
+                'color': final_color,
+            })
+        
+        print(f"Painterly: [{self.current_pass} PASS] Generated {len(tasks)} strokes for material '{material_name}'.")
+        return tasks
+    
+    @staticmethod
+    def apply_stroke_thread(brush_stroke, pos, angle, length, width, opacity, color, brush_cache):
+        from PIL import Image
+        import numpy as np
+        try:
+            x, y = pos
+            size_x = max(1, int(width))
+            size_y = max(1, int(length))
+            
+            # Use a tuple of (original_brush_id, size_x, size_y) as the cache key
+            cache_key = (id(brush_stroke), size_x, size_y)
+            
+            if cache_key in brush_cache:
+                brush_resized = brush_cache[cache_key]
+            else:
+                brush_resized = brush_stroke.resize((size_x, size_y), Image.Resampling.LANCZOS)
+                brush_cache[cache_key] = brush_resized
+
+            brush_rotated = brush_resized.rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
+
+            # Optimization with NumPy
+            brush_arr = np.array(brush_rotated)
+            
+            # Create an array for the color
+            color_arr = np.array(color, dtype=np.uint8)
+            
+            # Use the alpha channel of the brush to blend the color
+            alpha = brush_arr[:, :, 3] / 255.0
+            
+            # Create a colored stroke array
+            colored_stroke_arr = np.zeros_like(brush_arr)
+            colored_stroke_arr[:, :, :3] = color_arr[:3]
+            colored_stroke_arr[:, :, 3] = (alpha * color_arr[3]).astype(np.uint8)
+            
+            colored_stroke = Image.fromarray(colored_stroke_arr, 'RGBA')
+
+            offset_x = x - brush_rotated.width // 2
+            offset_y = y - brush_rotated.height // 2
+            return (colored_stroke, (offset_x, offset_y))
+        except Exception as e:
+            print(f"Error applying stroke in thread: {e}")
+            return (None, None)
 
 class AddDisplacementOperator(Operator):
     bl_idname = "texture.add_displacement"
@@ -2927,8 +3792,7 @@ class AddDisplacementOperator(Operator):
                         lnks.new(normal_nodes[i].outputs["Normal"], mix_rgb.inputs[1])
                         lnks.new(chain_output, mix_rgb.inputs[2])
                         drv = mix_rgb.inputs["Fac"].driver_add("default_value").driver
-                        # --- ROBUST DRIVER EXPRESSION ---
-                        drv.expression = f"1 - (int(((frame - 1) / step)) % max(fc, 1) + 1 == {i+1})"
+                        drv.expression = f"1 - (int(((frame - 1) / max(step, 1))) % max(fc, 1) + 1 == {i+1})"
                         
                         driver = drv
                         vars = {v.name: v for v in driver.variables}
@@ -2968,9 +3832,8 @@ class AddDisplacementOperator(Operator):
 # ---------------------------
 
 def get_stroke_preset_item(obj, folder_props):
-    if not obj:
+    if not _obj_alive(obj):
         return None
-    # support old curves which put the path on obj.data instead of obj
     path = obj.get("painterly_stroke_path") or getattr(obj.data, "get", lambda k: None)("painterly_stroke_path")
     if not path:
         return None
@@ -2982,11 +3845,11 @@ def get_stroke_preset_item(obj, folder_props):
     
 def get_stroke_colors(obj):
     colors = []
-    if not obj or not obj.active_material or not obj.active_material.node_tree:
+    if not _obj_alive(obj) or not obj.active_material or not obj.active_material.node_tree:
         return colors
         
     mat_nodes = obj.active_material.node_tree.nodes
-    ramp_node = mat_nodes.get("StrokeColorRamp_1") # Check static/first frame
+    ramp_node = mat_nodes.get("StrokeColorRamp_1")
     
     if ramp_node:
         elements = ramp_node.color_ramp.elements
@@ -3053,7 +3916,7 @@ class StrokeBrushPanel(Panel):
                 if geo_props.geo_node_mode_enabled:
                     active_obj = context.active_object
                     active_primary_stroke = None
-                    if active_obj:
+                    if _obj_alive(active_obj):
                         mod = get_geo_node_modifier(active_obj)
                         if mod:
                             active_primary_stroke = next((ps for ps in geo_props.primary_strokes if ps.obj == active_obj), None)
@@ -3082,7 +3945,8 @@ class StrokeBrushPanel(Panel):
                             geo_node_box.label(text="No Primary Strokes defined.", icon='INFO')
                         
                         for i, ps in enumerate(geo_props.primary_strokes):
-                            self.draw_primary_stroke_box(geo_node_box, ps, i, context)
+                            if _obj_alive(ps.obj):
+                                self.draw_primary_stroke_box(geo_node_box, ps, i, context)
                 else:
                     self.draw_legacy_stroke_pen_ui(context)
             else:
@@ -3093,13 +3957,15 @@ class StrokeBrushPanel(Panel):
 
     def draw_primary_stroke_box(self, layout, ps, index, context):
         """Helper to draw the UI box for a single primary stroke."""
+        if not _obj_alive(ps.obj):
+            return 
+            
         folder_props = context.scene.painterly_folder_properties
         box = layout.box()
         
         header_row = box.row(align=True)
         header_row.alignment = 'LEFT'
 
-        # --- Display Primary Stroke Thumbnail ---
         has_custom_icon = False
         custom_icon_id = 0
         preset_item = get_stroke_preset_item(ps.obj, folder_props)
@@ -3117,81 +3983,93 @@ class StrokeBrushPanel(Panel):
              op_select = header_row.operator("painterly.select_object", text="", icon='RESTRICT_SELECT_OFF')
              op_select.obj_name = ps.obj.name if ps.obj else ""
         
-        if ps.obj:
-            header_row.label(text=f"{ps.obj.name}", icon='MOD_CURVE')
+        header_row.label(text=f"{ps.obj.name}", icon='MOD_CURVE')
         
         op_rem_ps = header_row.operator("painterly.remove_primary_stroke", text="", icon='X')
         op_rem_ps.primary_stroke_index = index
 
-        if ps.obj:
-            instance_box = box.box()
-            row = instance_box.row(align=True)
-            row.alignment = 'LEFT'
-            row.label(text=f"Instances ({len(ps.secondary_strokes)})", icon='OBJECT_DATA')
+        instance_box = box.box()
+        row = instance_box.row(align=True)
+        row.alignment = 'LEFT'
+        row.label(text=f"Instances ({len(ps.secondary_strokes)})", icon='OBJECT_DATA')
+        
+        if not ps.secondary_strokes:
+            instance_box.label(text="   (Empty)", icon='INFO')
+        
+        for j, ss in enumerate(ps.secondary_strokes):
+            if not _obj_alive(ss.obj):
+                continue
+                
+            ss_box = instance_box.box()
+            ss_header = ss_box.row(align=True)
+
+            op_vis = ss_header.operator("painterly.toggle_instance_visibility", text="", icon='RESTRICT_VIEW_OFF' if not ss.obj.hide_get() else 'RESTRICT_VIEW_ON', emboss=False)
+            op_vis.obj_name = ss.obj.name
+
+            has_secondary_icon = False
+            secondary_icon_id = 0
+            secondary_preset_item = get_stroke_preset_item(ss.obj, folder_props)
+            if secondary_preset_item and secondary_preset_item.preview_image:
+                if secondary_preset_item.preview_image not in custom_icons:
+                    try: custom_icons.load(secondary_preset_item.preview_image, secondary_preset_item.preview_filepath, 'IMAGE')
+                    except: pass
+                if secondary_preset_item.preview_image in custom_icons:
+                    secondary_icon_id = custom_icons[secondary_preset_item.preview_image].icon_id
+                    has_secondary_icon = True
             
-            if not ps.secondary_strokes:
-                instance_box.label(text="   (Empty)", icon='INFO')
+            if has_secondary_icon:
+                ss_header.template_icon(secondary_icon_id, scale=2.0)
+            else:
+                ss_header.label(text="", icon='OBJECT_DATA')
+
+            op_sel = ss_header.operator("painterly.select_object", text=ss.obj.name, emboss=False)
+            op_sel.obj_name = ss.obj.name
             
-            for j, ss in enumerate(ps.secondary_strokes):
-                ss_box = instance_box.box()
-                ss_header = ss_box.row(align=True)
+            op_rem = ss_header.operator("painterly.remove_secondary_stroke", text="", icon='X')
+            op_rem.primary_stroke_index = index
+            op_rem.secondary_stroke_index = j
 
-                # --- Visibility Toggle ---
-                if ss.obj:
-                    op_vis = ss_header.operator("painterly.toggle_instance_visibility", text="", icon='RESTRICT_VIEW_OFF' if not ss.obj.hide_get() else 'RESTRICT_VIEW_ON', emboss=False)
-                    op_vis.obj_name = ss.obj.name
-                else:
-                    ss_header.label(text="", icon='GHOST_ENABLED')
+            ss_controls_box = ss_box.box()
+            col = ss_controls_box.column(align=True)
+            col.prop(ss, "density")
+            col.prop(ss, "scale")
+            if not ss.use_align_rotation:
+                col.prop(ss, "rotation_randomness")
+            col.prop(ss, "merge_distance")
+            
+            col.separator()
+            
+            density_mask_box = ss_controls_box.box()
+            density_mask_box.label(text="Density Mask", icon='MOD_VERTEX_WEIGHT')
 
+            row_dm = density_mask_box.row()
+            row_dm.scale_y = 1.3
+            row_dm.prop(ss, "use_density_mask", text="Use Density Mask", icon='STROKE', toggle=True)
 
-                # --- Secondary Stroke Thumbnail ---
-                has_secondary_icon = False
-                secondary_icon_id = 0
-                secondary_preset_item = get_stroke_preset_item(ss.obj, folder_props)
-                if secondary_preset_item and secondary_preset_item.preview_image:
-                    if secondary_preset_item.preview_image not in custom_icons:
-                        try: custom_icons.load(secondary_preset_item.preview_image, secondary_preset_item.preview_filepath, 'IMAGE')
-                        except: pass
-                    if secondary_preset_item.preview_image in custom_icons:
-                        secondary_icon_id = custom_icons[secondary_preset_item.preview_image].icon_id
-                        has_secondary_icon = True
-                
-                if has_secondary_icon:
-                    ss_header.template_icon(secondary_icon_id, scale=2.0)
-                else:
-                    ss_header.label(text="", icon='OBJECT_DATA')
+            if ps.obj.type == 'MESH':
+                if ss.use_density_mask:
+                    density_mask_box.prop_search(
+                        ss, "density_vertex_group",
+                        ps.obj, "vertex_groups",
+                        text="Mask"
+                    )
+            elif ss.use_density_mask:
+                density_mask_box.label(text="Primary object must be a Mesh to use a vertex-group mask.", icon='ERROR')
 
-                op_sel = ss_header.operator("painterly.select_object", text=ss.obj.name if ss.obj else "INVALID", emboss=False)
-                if ss.obj: op_sel.obj_name = ss.obj.name
-                
-                op_rem = ss_header.operator("painterly.remove_secondary_stroke", text="", icon='X')
-                op_rem.primary_stroke_index = index
-                op_rem.secondary_stroke_index = j
+            if ss.align_rotation_available:
+                align_box = ss_controls_box.box()
+                align_box.prop(ss, "use_align_rotation")
+                if ss.use_align_rotation:
+                    align_box.prop(ss, "align_axis", expand=True)
+            else:
+                ss_controls_box.label(text="Align Rotation N/A", icon='ERROR')
 
-                ss_controls_box = ss_box.box()
-                col = ss_controls_box.column(align=True)
-                col.prop(ss, "density")
-                col.prop(ss, "scale")
-                if not ss.use_align_rotation:
-                    col.prop(ss, "rotation_randomness")
-                col.prop(ss, "merge_distance")
-                
-                col.separator()
-
-                if ss.align_rotation_available:
-                    align_box = ss_controls_box.box()
-                    align_box.prop(ss, "use_align_rotation")
-                    if ss.use_align_rotation:
-                        align_box.prop(ss, "align_axis", expand=True)
-                else:
-                    ss_controls_box.label(text="Align Rotation N/A", icon='ERROR')
-
-                transform_box = ss_controls_box.box()
-                transform_box.prop(ss, "use_edit_transforms")
-                if ss.use_edit_transforms:
-                    transform_box.prop(ss, "translation")
-                    transform_box.prop(ss, "rotation")
-                    transform_box.prop(ss, "scale_transform")
+            transform_box = ss_controls_box.box()
+            transform_box.prop(ss, "use_edit_transforms")
+            if ss.use_edit_transforms:
+                transform_box.prop(ss, "translation")
+                transform_box.prop(ss, "rotation")
+                transform_box.prop(ss, "scale_transform")
 
 
     def draw_legacy_stroke_pen_ui(self, context):
@@ -3291,7 +4169,22 @@ class StrokeBrushPanel(Panel):
             opn_next = rowN2.operator("painterly.navigate_folder", text=">")
             opn_next.folder_type = 'normal'
             opn_next.direction = 'NEXT'
+        
+        # --- MODIFICATION START ---
+        # Moved the "Stroke Size" section here.
+        extr_box = layout.box()
+        extr_box.label(text="Stroke Size")
+        if stroke_props.lock_depth_to_extrusion:
+            extr_box.prop(stroke_props, "extrusion_locked", slider=True)
+        else:
+            extr_box.prop(stroke_props, "extrusion", slider=True)
+        extr_box.prop(stroke_props, "lock_depth_to_extrusion")
+        if not stroke_props.lock_depth_to_extrusion:
+            extr_box.prop(stroke_props, "depth", slider=True)
+        # --- MODIFICATION END ---
+        
         layout.prop(stroke_props, "normal_map_strength", text="Normal Map Strength", slider=True)
+        
         if stroke_props.use_secondary_color:
             mixer_box = layout.box()
             mixer_box.label(text="Color Mixer")
@@ -3326,16 +4219,7 @@ class StrokeBrushPanel(Panel):
         alpha_box = layout.box()
         alpha_box.label(text="Alpha Channel")
         alpha_box.prop(stroke_props, "use_alpha_channel", text="Use Alpha Channel")
-        extr_box = layout.box()
-        extr_box.label(text="3D Extrusion")
-        if stroke_props.lock_depth_to_extrusion:
-            extr_box.prop(stroke_props, "extrusion_locked", slider=True)
-        else:
-            extr_box.prop(stroke_props, "extrusion", slider=True)
-        extr_box.prop(stroke_props, "lock_depth_to_extrusion")
-        if not stroke_props.lock_depth_to_extrusion:
-            extr_box.prop(stroke_props, "depth", slider=True)
-        
+
         solidify_box = layout.box()
         solidify_box.label(text="Solidify")
         solidify_box.prop(stroke_props, "use_solidify", text="Enable Solidify")
@@ -3378,7 +4262,6 @@ class StrokeBrushPanel(Panel):
                 eff_box.prop(stroke_props, "effect_noise_roughness", slider=True)
                 eff_box.prop(stroke_props, "effect_noise_distortion", slider=True)
         
-        # --- NEW: Wave Modifier UI ---
         eff_box.separator()
         obj = context.active_object
         mod = None
@@ -3409,35 +4292,49 @@ class StrokeBrushPanel(Panel):
         layout = self.layout
         folder_props = context.scene.painterly_folder_properties
         stylized_props = context.scene.stylized_painterly_properties
+        stroke_props = context.scene.stroke_brush_properties
+        obj = context.active_object
         image_scale = 12
 
-        p_box = layout.box()
-        p_box.label(text="Preset Selection")
-        row = p_box.row(align=True)
-        row.prop(folder_props, "show_preset_grid", text="Grid View", toggle=True)
-        if folder_props.show_preset_grid:
-            row.prop(folder_props, "previews_per_page", text="Count")
-        if folder_props.show_preset_grid:
-            row2 = p_box.row(align=True)
-            op_prev = row2.operator("painterly.navigate_folder", text="<")
-            op_prev.folder_type = 'preset'
-            op_prev.direction = 'PREV'
-            total = len(folder_props.preset_folders)
-            pg = (folder_props.current_preset_index // folder_props.previews_per_page) + 1 if total > 0 else 1
-            row2.label(text=f"Page {pg}")
-            op_next = row2.operator("painterly.navigate_folder", text=">")
-            op_next.folder_type = 'preset'
-            op_next.direction = 'NEXT'
-            draw_preview_grid(p_box, folder_props.preset_folders, folder_props.current_preset_index, 'preset', context, image_scale)
+        box = layout.box()
+        box.label(text="Brush Preset Selection")
+        box.prop(stylized_props, "include_stroke_pen_alphas", toggle=True)
+
+        if stylized_props.include_stroke_pen_alphas:
+            cat_box = box.box()
+            cat_box.label(text="Category Selection")
+            cat_box.prop(folder_props, "selected_stroke_type", text="Main")
+            if folder_props.selected_stroke_type != "ALL":
+                cat_box.prop(folder_props, "selected_stroke_subtype", text="Subfolder")
+
+        box.prop(stylized_props, "show_preset_list", toggle=True)
+        
+        if stylized_props.show_preset_list:
+            preset_box = box.box()
+            row = preset_box.row(align=True)
+            row.operator("painterly.select_all_presets", text="All").select_all = True
+            row.operator("painterly.select_all_presets", text="None").select_all = False
+            scroll_box = preset_box.box()
+            for item in stylized_props.preset_selections:
+                row = scroll_box.row(align=True)
+                row.prop(item, "selected")
+                row.label(text=item.name)
         else:
+            p_box = box.box()
             row2 = p_box.row(align=True)
-            op_prev = row2.operator("painterly.navigate_folder", text="<")
-            op_prev.folder_type = 'preset'
+            
+            nav_folder_type = 'stroke' if stylized_props.include_stroke_pen_alphas else 'preset'
+
+            op_prev = row2.operator("painterly.navigate_folder", text="<", emboss=True)
+            op_prev.folder_type = nav_folder_type
             op_prev.direction = 'PREV'
-            if folder_props.preset_folders:
-                idx = folder_props.current_preset_index
-                if idx < len(folder_props.preset_folders):
-                    cpres = folder_props.preset_folders[idx]
+
+            collection_to_use = folder_props.stroke_folders if stylized_props.include_stroke_pen_alphas else folder_props.preset_folders
+            index_to_use = folder_props.current_stroke_index if stylized_props.include_stroke_pen_alphas else folder_props.current_preset_index
+            
+            if collection_to_use:
+                if index_to_use < len(collection_to_use):
+                    cpres = collection_to_use[index_to_use]
                     row2.label(text=cpres.name)
                     if cpres.preview_image and cpres.preview_image not in custom_icons:
                         try:
@@ -3447,21 +4344,73 @@ class StrokeBrushPanel(Panel):
                     if cpres.preview_image and cpres.preview_image in custom_icons:
                         preview_box = p_box.box()
                         preview_box.template_icon(icon_value=custom_icons[cpres.preview_image].icon_id, scale=image_scale)
-            op_next = row2.operator("painterly.navigate_folder", text=">")
-            op_next.folder_type = 'preset'
+
+            op_next = row2.operator("painterly.navigate_folder", text=">", emboss=True)
+            op_next.folder_type = nav_folder_type
             op_next.direction = 'NEXT'
+        
         layout.operator("texture.auto_bake")
-        layout.prop(stylized_props, "image")
-        layout.prop(stylized_props, "random_seed")
-        layout.prop(stylized_props, "batch_mode", text="Batch Mode")
-        if stylized_props.batch_mode:
-            layout.prop(stylized_props, "batch_folder", text="Output Folder")
-            layout.prop(stylized_props, "batch_amount")
+        layout.separator()
+        
+        color_pass_box = layout.box()
+        color_pass_box.prop(stylized_props, "enable_color_pass", toggle=True)
+        row = color_pass_box.row()
+        row.prop(stylized_props, "only_color_pass")
+        row.enabled = stylized_props.enable_color_pass
+        
+        settings_box = layout.box()
+        settings_box.label(text="Texture Generation Settings")
+        
+        settings_box.prop(stylized_props, "stroke_density", slider=True)
+        settings_box.prop(stylized_props, "average_stroke_size", slider=True)
+        settings_box.separator()
+        settings_box.prop(stylized_props, "dynamic_strokes", slider=True)
+        
+        settings_box.separator()
+        
+        settings_box.prop(stylized_props, "random_seed")
+        settings_box.prop(stylized_props, "resolution", text="Resolution")
+        settings_box.prop(stroke_props, "normal_map_strength", slider=True)
+
+        disp_box = settings_box.box()
+        disp_box.label(text="Displacement")
+        disp_box.prop(stroke_props, "displacement_height", text="Height", slider=True)
+        disp_box.prop(stroke_props, "displacement_midlevel", text="Midlevel", slider=True)
+        disp_box.prop(stroke_props, "displacement_scale", text="Scale", slider=True)
+        
+        color_box = settings_box.box()
+        color_box.label(text="Material & Color")
+        color_box.prop(stylized_props, "preserve_material_color")
+
+        if _obj_alive(obj):
+            mat_slots_box = settings_box.box()
+            mat_slots_box.label(text="Material Slots")
+            if obj.material_slots:
+                mat_slots_box.prop(stylized_props, "process_all_materials")
+                for i, slot in enumerate(obj.material_slots):
+                    row = mat_slots_box.row(align=True)
+                    icon = 'DOT'
+                    if i == obj.active_material_index:
+                        icon = 'TRIA_RIGHT'
+                    row.label(text=slot.name or "Empty Slot", icon=icon)
+            else:
+                mat_slots_box.label(text="No material slots on object.")
+        else:
+            settings_box.label(text="No active object selected.", icon='ERROR')
+        
+        is_processing = getattr(context.window_manager, 'painterly_is_processing', False)
+        
         if not check_pillow():
-            layout.operator("painterly.install_dependencies", text="Install Dependencies (PIL)", icon='IMPORT')
+            layout.operator("painterly.install_dependencies", text="Install Dependencies", icon='IMPORT')
+        elif is_processing:
+            layout.operator("painterly.cancel_effect", text="CANCEL", icon='CANCEL', depress=True)
+            progress_text = getattr(context.window_manager, 'painterly_progress_text', "")
+            layout.label(text=f"Processing... {progress_text}")
         else:
             layout.operator("texture.apply_painterly_effect", text="Apply Painterly Effect", icon='PLUS')
-        layout.label(text="May take up to 1 minute", icon='INFO')
+
+        layout.label(text="Processing may take a moment.", icon='INFO')
+
 
 def draw_preview_grid(layout, folder_collection, current_index, folder_type, context, image_scale):
     global custom_icons
@@ -3499,11 +4448,14 @@ classes_to_register = [
     FolderItem,
     PainterlyFolderProperties,
     AddonProperties,
+    PresetSelectionItem,
+    PainterlyProperties,
+    PAINTERLY_OT_SelectAllPresets,
     GeoNodeSecondaryStroke,
     GeoNodePrimaryStroke,
     GeoNodeProperties,
     StrokeBrushProperties,
-    PainterlyProperties,
+    PAINTERLY_OT_RefreshPrimaryMaterial,
     PAINTERLY_OT_AddPrimaryStroke,
     PAINTERLY_OT_InstanceStroke,
     PAINTERLY_OT_RemovePrimaryStroke,
@@ -3523,6 +4475,7 @@ classes_to_register = [
     AutoStrokeOperator,
     AutoBakeOperator,
     PainterlyEffectOperator,
+    PAINTERLY_OT_CancelEffect,
     AddDisplacementOperator,
     StrokeBrushPanel,
     RefreshPreviewsOperator,
@@ -3534,9 +4487,9 @@ def register():
     global custom_icons
     custom_icons = bpy.utils.previews.new()
     
-    bpy.types.WindowManager.painterly_color_swatch = FloatVectorProperty(
-        name="Color Swatch", subtype='COLOR', size=4
-    )
+    bpy.types.WindowManager.painterly_is_processing = BoolProperty(default=False)
+    bpy.types.WindowManager.painterly_cancel_requested = BoolProperty(default=False)
+    bpy.types.WindowManager.painterly_progress_text = StringProperty(default="")
     
     for cls in classes_to_register:
         bpy.utils.register_class(cls)
@@ -3547,7 +4500,6 @@ def register():
     bpy.types.Scene.stylized_painterly_properties = PointerProperty(type=PainterlyProperties)
     bpy.types.Scene.geo_node_properties = PointerProperty(type=GeoNodeProperties)
 
-    # --- CORRECTED AUTO-DETECT ---
     try:
         addon_prefs_owner = bpy.context.preferences.addons.get(get_addon_key())
         if addon_prefs_owner:
@@ -3563,10 +4515,14 @@ def register():
         bpy.app.handlers.load_post.append(painterly_load_post_handler)
     if painterly_frame_change_post not in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.append(painterly_frame_change_post)
+    if painterly_depsgraph_update_post not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(painterly_depsgraph_update_post)
 
 def unregister():
     global custom_icons
 
+    if painterly_depsgraph_update_post in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(painterly_depsgraph_update_post)
     if painterly_frame_change_post in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.remove(painterly_frame_change_post)
     if painterly_load_post_handler in bpy.app.handlers.load_post:
@@ -3583,8 +4539,13 @@ def unregister():
         del bpy.types.Scene.painterly_folder_properties
         del bpy.types.Scene.geo_node_properties
         
-        if hasattr(bpy.types.WindowManager, 'painterly_color_swatch'):
-            del bpy.types.WindowManager.painterly_color_swatch
+        if hasattr(bpy.types.WindowManager, 'painterly_is_processing'):
+            del bpy.types.WindowManager.painterly_is_processing
+        if hasattr(bpy.types.WindowManager, 'painterly_cancel_requested'):
+            del bpy.types.WindowManager.painterly_cancel_requested
+        if hasattr(bpy.types.WindowManager, 'painterly_progress_text'):
+            del bpy.types.WindowManager.painterly_progress_text
+
     except (AttributeError, RuntimeError):
         pass
 
