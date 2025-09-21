@@ -1,8 +1,9 @@
 {
     "version": [2, 5, 0],
     "url": "https://raw.githubusercontent.com/Doughy-animation/Painterly/refs/heads/main/__init__.py",
-    "changelog": "NEW Geometry Node Mode, new buttons and controls for adding a wave modifer and a solidify modifer. Painterly Texture Mode has been completely rebuilt is significantly improved! VISIT doughyanimation.com/painterly for the latest documentation"
+    "changelog": "NEW Geometry Node Mode, new buttons and controls for adding a wave modifier and a solidify modifier. Painterly Texture Mode has been completely rebuilt and has been significantly improved! VISIT doughyanimation.com/painterly for the latest documentation"
 }
+
 
 
 
