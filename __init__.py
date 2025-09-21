@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly",
     "author": "Patrick Daugherty - Doughy Animation Studio",
-    "version": (2, 5, 0), # Version updated to reflect major changes
+    "version": (2, 5, 0), # Version updated for new features
     "blender": (2, 9, 3),
     "location": "View3D > Sidebar > Painterly",
     "description": ("Stylized painterly strokes and textures with GPU acceleration and a real-time proxy workflow. "
@@ -49,6 +49,8 @@ except ImportError:
     CUPY_AVAILABLE = False
     print("[Painterly] CuPy not found. Using CPU fallback for rendering.")
 
+# --- NEW: EFFICIENT DEBOUNCE SYSTEM GLOBALS ---
+PAINTERLY_COLOR_TRANSITIONS = {}
 
 # -------------------------------------------------------------------------
 # Helper utilities
@@ -181,21 +183,6 @@ def _repair_painterly_drivers_after_update(scene):
                     
     if fixed_count > 0:
         print(f"[Painterly] Repaired {fixed_count} outdated material drivers in the scene.")
-
-# ---------------------------
-# GLOBALS & DEBOUNCE VARIABLES
-# ---------------------------
-last_color_update_time = 0.0
-DEBOUNCE_INTERVAL = 0.1
-DEBOUNCE_TOTAL_DELAY = 0.2
-_in_update_color = False
-
-# ---------------------------
-# Robust ramp-update queue
-# ---------------------------
-pending_inactive_ramp_refs = []  # list of (material_name, node_name)
-_timer_registered = False
-
 
 # ---------------------------------------------------------------------------
 # START: ROOT FOLDER PERSISTENCE & PREFERENCES
@@ -503,7 +490,7 @@ class PAINTERLY_OT_save_preferences(Operator):
 
 class PAINTERLY_OT_open_feedback(Operator):
     bl_idname = "painterly.open_feedback"
-    bl_label  = "Open Feedback Page"
+    bl_label  = "Feedback"
 
     def execute(self, context):
         bpy.ops.wm.url_open(url="https://www.doughyanimation.com/contact")
@@ -512,7 +499,7 @@ class PAINTERLY_OT_open_feedback(Operator):
 
 class PAINTERLY_OT_open_youtube(Operator):
     bl_idname = "painterly.open_youtube"
-    bl_label  = "Open YouTube Channel"
+    bl_label  = "YouTube"
 
     def execute(self, context):
         bpy.ops.wm.url_open(url="https://www.youtube.com/@doughyanimation")
@@ -580,137 +567,187 @@ class PainterlyAddonPreferences(AddonPreferences):
         row.operator("painterly.open_youtube",  icon='URL')
 
 
-# ----- NEW COLOR MIXER CODE START -----
+# ----- EFFICIENT DEBOUNCE & COLOR SYSTEM START -----
 
-def schedule_inactive_ramp_updates(context):
-    """Register a single-shot timer if not already registered."""
-    global _timer_registered
-    try:
-        if not _timer_registered or not bpy.app.timers.is_registered(debounce_update_inactive_ramp_nodes):
-            _timer_registered = True
-            bpy.app.timers.register(debounce_update_inactive_ramp_nodes, first_interval=DEBOUNCE_TOTAL_DELAY)
-    except Exception as e:
-        print("schedule_inactive_ramp_updates error:", e)
-
-
-def debounce_update_inactive_ramp_nodes():
-    """
-    Fire after the user stops dragging sliders for DEBOUNCE_TOTAL_DELAY.
-    Drain the whole queue in one go, re-resolving nodes by (material_name, node_name).
-    Stop the timer when done.
-    """
-    global last_color_update_time, pending_inactive_ramp_refs, _timer_registered
-
-    try:
-        # Keep waiting while the user is still interacting.
-        if time.time() - last_color_update_time < DEBOUNCE_TOTAL_DELAY:
-            return DEBOUNCE_INTERVAL  # keep deferring
-
-        # Drain the queue atomically
-        while pending_inactive_ramp_refs:
-            mat_name, node_name = pending_inactive_ramp_refs.pop(0)
-
-            mat = bpy.data.materials.get(mat_name)
-            if not mat or not mat.node_tree:
-                continue
-
-            node = mat.node_tree.nodes.get(node_name)
-            if node and node.type == 'VALTORGB':
-                update_ramp_node(node)
-
-    except Exception as e:
-        print("Error in debounce_update_inactive_ramp_nodes:", e)
-
-    # Done; turn the timer off
-    _timer_registered = False
-    return None  # stop the timer
-
-def update_ramp_node(node):
-    """
-    Rebuilds *all* colour stops of the given ColorRamp node to reflect
-    the current StrokeBrushProperties.
-    """
-    props = bpy.context.scene.stroke_brush_properties
-
-    while len(node.color_ramp.elements) > 1:
-        node.color_ramp.elements.remove(node.color_ramp.elements[-1])
-
-    node.color_ramp.elements[0].color = props.color
-
-    sec_list  = []
+def _get_target_colors_from_ui(props):
+    """Gathers the current color configuration from the UI properties."""
+    colors = [tuple(props.color)] 
     if props.use_secondary_color:
-        sec_list.append(props.secondary_color)
-        sec_list.extend([ac.color for ac in props.additional_secondary_colors])
+        colors.append(tuple(props.secondary_color))
+        colors.extend([tuple(ac.color) for ac in props.additional_secondary_colors])
+    colors.extend([tuple(ac.color) for ac in props.additional_base_colors])
+    return colors
 
-    base_list  = [ac.color for ac in props.additional_base_colors]
-    final_list = base_list + sec_list
 
-    for _ in final_list:
-        node.color_ramp.elements.new(1.0)
+def _apply_colors_to_ramp(node, colors, mixer, offset):
+    """Applies a list of colors and mixer settings to a single color ramp node."""
+    if not node or not hasattr(node, "color_ramp"): return
 
-    n_total = len(node.color_ramp.elements)
-    if n_total > 1:
-        for i, el in enumerate(node.color_ramp.elements):
-            el.position = max(
-                0.0,
-                min(
-                    ((i / (n_total - 1)) ** props.color_mixer)
-                    + props.color_mixer_offset,
-                    1.0
-                )
-            )
+    ramp = node.color_ramp
+    # Adjust number of elements
+    while len(ramp.elements) > len(colors):
+        ramp.elements.remove(ramp.elements[-1])
+    while len(ramp.elements) < len(colors):
+        ramp.elements.new(1.0)
 
-    node.color_ramp.elements[0].color = props.color
-    idx = 1
-    for col in final_list:
-        node.color_ramp.elements[idx].color = col
-        idx += 1
+    num_elements = len(ramp.elements)
+    if num_elements == 0: return
 
-def update_color(context):
+    # Apply colors and positions
+    for i, el in enumerate(ramp.elements):
+        el.color = colors[i]
+        if num_elements > 1:
+            pos = ((i / (num_elements - 1)) ** mixer) + offset
+            el.position = max(0.0, min(pos, 1.0))
+        else:
+            el.position = 0.0
+
+def update_color(self, context):
     """
-    Kick-off routine that updates the *active* ramp immediately and
-    queues all *inactive* ramps for deferred update (debounced).
+    Main callback for any color or mixer property change. This is the entry point.
     """
-    global _in_update_color, last_color_update_time, pending_inactive_ramp_refs
-    last_color_update_time = time.time()
+    global PAINTERLY_COLOR_TRANSITIONS
+
+    obj = context.active_object
+    if not _obj_alive(obj) or not obj.active_material:
+        return
+
+    mat = obj.active_material
     props = context.scene.stroke_brush_properties
-
-    if props.animation_mode == 'STATIC':
-        update_active_color_ramp(context)
+    frame_count = mat.get("frame_count", 1)
+    
+    target_colors = _get_target_colors_from_ui(props)
+    
+    # For static materials, update all ramps instantly and clear any old transition data.
+    if frame_count <= 1:
+        if mat.name in PAINTERLY_COLOR_TRANSITIONS:
+            del PAINTERLY_COLOR_TRANSITIONS[mat.name]
+        for node in mat.node_tree.nodes:
+            if node.type == 'VALTORGB' and node.name.startswith("StrokeColorRamp_"):
+                _apply_colors_to_ramp(node, target_colors, props.color_mixer, props.color_mixer_offset)
         return
 
-    if _in_update_color:
-        return
+    # --- Animated Material Logic ---
+    # 1. Instantly update the currently active color ramp for immediate UI feedback.
+    active_index = (int(((context.scene.frame_current - 1) / props.step_value)) % frame_count) + 1
+    active_ramp_node = mat.node_tree.nodes.get(f"StrokeColorRamp_{active_index}")
+    if active_ramp_node:
+        _apply_colors_to_ramp(active_ramp_node, target_colors, props.color_mixer, props.color_mixer_offset)
 
-    _in_update_color = True
-    try:
-        update_active_color_ramp(context)
-        pending_inactive_ramp_refs.clear()
-        obj = context.object
-        if obj and obj.type == 'CURVE' and obj.data.materials:
-            mat = obj.data.materials[0]
-            fc = mat.get("frame_count", None)
-            active_index = None
-            if fc and fc > 0:
-                step = props.step_value
-                frame = context.scene.frame_current
-                active_index = (int(((frame - 1) / step)) % fc) + 1
+    # 2. Set up the transition job for all other ramps.
+    start_colors = []
+    if mat.name in PAINTERLY_COLOR_TRANSITIONS:
+        # If a transition is running, grab the current interpolated state to start the new one seamlessly.
+        data = PAINTERLY_COLOR_TRANSITIONS[mat.name]
+        elapsed = time.time() - data['start_time']
+        progress = min(1.0, elapsed / data['duration'])
+        for i in range(len(data['target_colors'])):
+            start_col = data['start_colors'][i]
+            target_col = data['target_colors'][i]
+            interp_col = tuple(s + (t - s) * progress for s, t in zip(start_col, target_col))
+            start_colors.append(interp_col)
+    else:
+        # If no transition is running, read colors from the instantly updated ramp.
+        if active_ramp_node:
+             start_colors = [tuple(el.color) for el in active_ramp_node.color_ramp.elements]
+
+    # Ensure color lists match length for safe interpolation
+    max_len = max(len(start_colors), len(target_colors))
+    while len(start_colors) < max_len: start_colors.append(start_colors[-1] if start_colors else (1,1,1,1))
+    while len(target_colors) < max_len: target_colors.append(target_colors[-1] if target_colors else (1,1,1,1))
+    
+    # Store the new or updated transition job.
+    PAINTERLY_COLOR_TRANSITIONS[mat.name] = {
+        'start_time': time.time(),
+        'duration': 4.0,
+        'start_colors': start_colors,
+        'target_colors': target_colors,
+        'mixer': props.color_mixer,
+        'offset': props.color_mixer_offset,
+    }
+
+@persistent
+def painterly_frame_change_handler(scene):
+    """
+    This handler runs *after* the frame changes. It's the core of the new efficient system.
+    """
+    global PAINTERLY_COLOR_TRANSITIONS
+    if not PAINTERLY_COLOR_TRANSITIONS: return
+
+    current_time = time.time()
+    mats_to_finalize = []
+
+    for mat_name, data in PAINTERLY_COLOR_TRANSITIONS.items():
+        mat = bpy.data.materials.get(mat_name)
+        if not mat or not mat.node_tree:
+            mats_to_finalize.append(mat_name)
+            continue
+
+        elapsed = current_time - data['start_time']
+        
+        # If transition is over, mark for finalization.
+        if elapsed >= data['duration']:
+            mats_to_finalize.append(mat_name)
+            continue
+
+        # This is an active transition. Update the ramp for the new current frame.
+        props = scene.stroke_brush_properties
+        frame_count = mat.get("frame_count", 1)
+        if frame_count <= 1: continue
+
+        active_index = (int(((scene.frame_current - 1) / props.step_value)) % frame_count) + 1
+        active_ramp_node = mat.node_tree.nodes.get(f"StrokeColorRamp_{active_index}")
+
+        if active_ramp_node:
+            progress = min(1.0, elapsed / data['duration'])
+            interpolated_colors = []
+            for i in range(len(data['target_colors'])):
+                start_col = data['start_colors'][i]
+                target_col = data['target_colors'][i]
+                interp_col = tuple(s + (t - s) * progress for s, t in zip(start_col, target_col))
+                interpolated_colors.append(interp_col)
             
+            _apply_colors_to_ramp(active_ramp_node, interpolated_colors, data['mixer'], data['offset'])
+    
+    # Finalize and remove completed transitions.
+    if mats_to_finalize:
+        for mat_name in mats_to_finalize:
+            if mat_name in PAINTERLY_COLOR_TRANSITIONS:
+                data = PAINTERLY_COLOR_TRANSITIONS[mat_name]
+                mat = bpy.data.materials.get(mat_name)
+                if mat:
+                    # Apply the final target colors to all ramps to ensure consistency.
+                    for node in mat.node_tree.nodes:
+                         if node.type == 'VALTORGB' and node.name.startswith("StrokeColorRamp_"):
+                            _apply_colors_to_ramp(node, data['target_colors'], data['mixer'], data['offset'])
+                del PAINTERLY_COLOR_TRANSITIONS[mat_name]
+
+
+def force_update_all_color_ramps(self, context):
+    """
+    Callback for mode changes. Forces an immediate, full update on all ramps,
+    canceling any ongoing transitions.
+    """
+    global PAINTERLY_COLOR_TRANSITIONS
+    obj = context.object
+    if not _obj_alive(obj) or not obj.data or not hasattr(obj.data, 'materials'):
+        return
+
+    props = context.scene.stroke_brush_properties
+    target_colors = _get_target_colors_from_ui(props)
+        
+    for mat in obj.data.materials:
+        if not mat: continue
+        if mat.name in PAINTERLY_COLOR_TRANSITIONS:
+            del PAINTERLY_COLOR_TRANSITIONS[mat.name]
+        
+        if mat.node_tree:
             for node in mat.node_tree.nodes:
                 if node.type == 'VALTORGB' and node.name.startswith("StrokeColorRamp_"):
-                    try:
-                        node_index = int(node.name.split("_")[1])
-                        if node_index != active_index:
-                            # Queue a stable reference we can resolve later
-                            pending_inactive_ramp_refs.append((mat.name, node.name))
-                    except (ValueError, IndexError):
-                        continue
-        
-        schedule_inactive_ramp_updates(context)
-    finally:
-        _in_update_color = False
+                    _apply_colors_to_ramp(node, target_colors, props.color_mixer, props.color_mixer_offset)
 
-# ----- NEW COLOR MIXER CODE END -----
+# ----- EFFICIENT DEBOUNCE & COLOR SYSTEM END -----
+
 
 @persistent
 def painterly_frame_change_post(scene, depsgraph):
@@ -719,7 +756,7 @@ def painterly_frame_change_post(scene, depsgraph):
 # ---------------------------
 # Extras Update (Only optimized viewport is automatically updated)
 # ---------------------------
-def update_extras_strokes(context):
+def update_extras_strokes(self, context):
     stroke_props = context.scene.stroke_brush_properties
     for obj in bpy.data.objects:
         if obj.type == 'CURVE' and obj.name.startswith("Painterly_"):
@@ -740,8 +777,10 @@ def refresh_all_painterly_strokes(context):
             override_context = context.copy()
             override_context['object'] = obj
             
-            update_material_properties(override_context)
-            update_alpha_channel(override_context)
+            # Create a dummy self object for the callbacks
+            dummy_props = context.scene.stroke_brush_properties
+            update_material_properties(dummy_props, override_context)
+            update_alpha_channel(dummy_props, override_context)
 
 # ---------------------------
 # Other Operators
@@ -766,7 +805,7 @@ class SetCyclesRenderSettings(Operator):
         return {'FINISHED'}
 
 def update_additional_color(self, context):
-    update_color(context)
+    update_color(self, context)
 
 class AdditionalColor(PropertyGroup):
     color: FloatVectorProperty(
@@ -786,7 +825,7 @@ class PAINTERLY_OT_AddAdditionalColorSecondary(Operator):
         stroke_props = context.scene.stroke_brush_properties
         new_color = stroke_props.additional_secondary_colors.add()
         new_color.color = (1, 1, 1, 1)
-        update_color(context)
+        update_color(self, context)
         return {'FINISHED'}
 
 class PAINTERLY_OT_RemoveAdditionalColorSecondary(Operator):
@@ -797,7 +836,7 @@ class PAINTERLY_OT_RemoveAdditionalColorSecondary(Operator):
         stroke_props = context.scene.stroke_brush_properties
         if 0 <= self.index < len(stroke_props.additional_secondary_colors):
             stroke_props.additional_secondary_colors.remove(self.index)
-        update_color(context)
+        update_color(self, context)
         return {'FINISHED'}
 
 # ---------------------------
@@ -1697,20 +1736,10 @@ def update_active_color_ramp(context):
                 except:
                     continue
                 if node_index == active_index:
-                    update_ramp_node(node)
+                    target_colors = _get_target_colors_from_ui(props)
+                    _apply_colors_to_ramp(node, target_colors, props.color_mixer, props.color_mixer_offset)
 
-def update_inactive_color_ramps(context):
-    global pending_inactive_ramp_refs
-    if pending_inactive_ramp_refs:
-        mat_name, node_name = pending_inactive_ramp_refs.pop(0)
-        mat = bpy.data.materials.get(mat_name)
-        if mat and mat.node_tree:
-            ramp_node = mat.node_tree.nodes.get(node_name)
-            if ramp_node:
-                update_ramp_node(ramp_node)
-    return None
-
-def update_material_properties(context):
+def update_material_properties(self, context):
     props = context.scene.stroke_brush_properties
     obj = context.object
     if obj and obj.type == 'CURVE' and obj.data.materials:
@@ -1772,7 +1801,7 @@ def update_material_properties(context):
                 except Exception as e:
                     print("Error setting subsurface method:", e)
 
-def update_extrusion(context):
+def update_extrusion(self, context):
     props = context.scene.stroke_brush_properties
     obj = context.object
     if obj and obj.type == 'CURVE':
@@ -1783,7 +1812,7 @@ def update_extrusion(context):
             obj.data.extrude = props.extrusion
             obj.data.bevel_depth = props.depth
 
-def update_shrinkwrap_offset(context):
+def update_shrinkwrap_offset(self, context):
     props = context.scene.stroke_brush_properties
     obj = context.object
     if obj and obj.modifiers:
@@ -1879,7 +1908,7 @@ class PAINTERLY_OT_ToggleWaveModifier(Operator):
             self.report({'INFO'}, "Wave modifier added and moved to top.")
         return {'FINISHED'}
 
-def update_step_drivers(context):
+def update_step_drivers(self, context):
     props = context.scene.stroke_brush_properties
     obj = context.object
     if obj and obj.data.materials:
@@ -1924,7 +1953,7 @@ def update_step_drivers(context):
                             vars["fc"].targets[0].data_path = '["frame_count"]'
 
 
-def update_alpha_channel(context):
+def update_alpha_channel(self, context):
     props = context.scene.stroke_brush_properties
     obj = context.object
     if not obj or obj.type != 'CURVE' or not obj.data.materials:
@@ -2017,7 +2046,8 @@ class StrokeBrushProperties(PropertyGroup):
     animation_mode: EnumProperty(
         name="Stroke Mode",
         items=[('ANIMATED', "Animated", ""), ('STATIC', "Static", "")],
-        default='ANIMATED'
+        default='ANIMATED',
+        update=force_update_all_color_ramps
     )
     stroke_type: EnumProperty(
         name="Stroke Type",
@@ -2034,7 +2064,7 @@ class StrokeBrushProperties(PropertyGroup):
         default=0.5,
         min=0.0,
         max=1.0,
-        update=lambda s, c: update_color(c)
+        update=update_color
     )
     color: FloatVectorProperty(
         name="Base Color",
@@ -2043,13 +2073,13 @@ class StrokeBrushProperties(PropertyGroup):
         default=(1, 1, 1, 1),
         min=0.0,
         max=1.0,
-        update=lambda s, c: update_color(c)
+        update=update_color
     )
     additional_base_colors: CollectionProperty(type=AdditionalColor)
     use_secondary_color: BoolProperty(
         name="Use Secondary",
         default=False,
-        update=lambda s, c: update_color(c)
+        update=update_color
     )
     secondary_color: FloatVectorProperty(
         name="Secondary",
@@ -2058,7 +2088,7 @@ class StrokeBrushProperties(PropertyGroup):
         default=(1, 1, 1, 1),
         min=0.0,
         max=1.0,
-        update=lambda s, c: update_color(c)
+        update=update_color
     )
     additional_secondary_colors: CollectionProperty(type=AdditionalColor)
     metallic: FloatProperty(
@@ -2066,14 +2096,14 @@ class StrokeBrushProperties(PropertyGroup):
         default=0.0,
         min=0.0,
         max=1.0,
-        update=lambda s, c: update_material_properties(c)
+        update=update_material_properties
     )
     roughness: FloatProperty(
         name="Roughness",
         default=0.5,
         min=0.0,
         max=1.0,
-        update=lambda s, c: update_material_properties(c)
+        update=update_material_properties
     )
     emission: FloatProperty(
         name="Emission",
@@ -2081,20 +2111,20 @@ class StrokeBrushProperties(PropertyGroup):
         min=0.0,
         max=5.0,
         description="Controls emission strength",
-        update=lambda s, c: update_material_properties(c)
+        update=update_material_properties
     )
     subsurface_amount: FloatProperty(
         name="Subsurface",
         default=0.0,
         min=0.0,
         max=1.0,
-        update=lambda s, c: update_material_properties(c)
+        update=update_material_properties
     )
     use_alpha_channel: BoolProperty(
         name="Use Alpha Channel",
         default=True,
         description="Toggle connection of stroke image alpha to the BSDF Alpha",
-        update=lambda s, c: update_alpha_channel(c)
+        update=update_alpha_channel
     )
 
     global_tilt: FloatProperty(
@@ -2130,33 +2160,33 @@ class StrokeBrushProperties(PropertyGroup):
         default=0.0,
         min=-10.0,
         max=10.0,
-        update=lambda s, c: update_shrinkwrap_offset(c)
+        update=update_shrinkwrap_offset
     )
     extrusion: FloatProperty(
         name="Size",
         default=0.1,
         min=0.0,
         max=10.0,
-        update=lambda s, c: update_extrusion(c)
+        update=update_extrusion
     )
     extrusion_locked: FloatProperty(
         name="Size (Locked)",
         default=0.1,
         min=0.0,
         max=1.0,
-        update=lambda s, c: update_extrusion(c)
+        update=update_extrusion
     )
     lock_depth_to_extrusion: BoolProperty(
         name="Lock Depth",
         default=False,
-        update=lambda s, c: update_extrusion(c)
+        update=update_extrusion
     )
     depth: FloatProperty(
         name="Depth",
         default=0.0,
         min=0.0,
         max=10.0,
-        update=lambda s, c: update_extrusion(c)
+        update=update_extrusion
     )
     use_solidify: BoolProperty(
         name="Solidify",
@@ -2208,7 +2238,7 @@ class StrokeBrushProperties(PropertyGroup):
     optimized_viewport_strokes: BoolProperty(
         name="Optimize Viewport",
         default=False,
-        update=lambda s, c: update_extras_strokes(c)
+        update=update_extras_strokes
     )
     effect_type: EnumProperty(
         name="Effects",
@@ -2330,7 +2360,7 @@ class StrokeBrushProperties(PropertyGroup):
         default=1,
         min=1,
         max=12,
-        update=lambda s, c: update_step_drivers(c)
+        update=update_step_drivers
     )
     normal_map_strength: FloatProperty(
         name="Normal Map Strength",
@@ -2348,7 +2378,7 @@ class StrokeBrushProperties(PropertyGroup):
         min=0.0,
         max=10.0,
         description="Controls the radius for subsurface scattering (X, Y, Z)",
-        update=lambda s, c: update_material_properties(c)
+        update=update_material_properties
     )
     subsurface_scale: FloatProperty(
         name="Subsurface Scale",
@@ -2356,7 +2386,7 @@ class StrokeBrushProperties(PropertyGroup):
         min=0.0,
         max=10.0,
         description="Controls the scale for subsurface scattering",
-        update=lambda s, c: update_material_properties(c)
+        update=update_material_properties
     )
     color_mixer_offset: FloatProperty(
         name="Color Mixer",
@@ -2364,7 +2394,7 @@ class StrokeBrushProperties(PropertyGroup):
         default=0.0,
         min=-3.0,
         max=3.0,
-        update=lambda s, c: update_color(c)
+        update=update_color
     )
 
 # ---------------------------
@@ -2571,8 +2601,8 @@ def painterly_depsgraph_update_post(scene, depsgraph):
 
 @persistent
 def painterly_load_post_handler(dummy):
-    if painterly_frame_change_post not in bpy.app.handlers.frame_change_post:
-        bpy.app.handlers.frame_change_post.append(painterly_frame_change_post)
+    if painterly_frame_change_handler not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(painterly_frame_change_handler)
     if painterly_depsgraph_update_post not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(painterly_depsgraph_update_post)
         
@@ -2941,7 +2971,10 @@ class AutoStrokeOperator(Operator):
                     ramp_node.name = f"StrokeColorRamp_{i+1}"
                     ramp_node.location = (-900, 400 - i * 300)
                     links.new(img_node.outputs["Color"], ramp_node.inputs["Fac"])
-                    update_ramp_node(ramp_node)
+                    
+                    target_colors = _get_target_colors_from_ui(props)
+                    _apply_colors_to_ramp(ramp_node, target_colors, props.color_mixer, props.color_mixer_offset)
+
                     bsdf_node = nodes.new("ShaderNodeBsdfPrincipled")
                     bsdf_node.parent = base_color_frame
                     bsdf_node.name = f"StrokeBSDF_{i+1}"
@@ -3097,7 +3130,10 @@ class AutoStrokeOperator(Operator):
                 ramp_node.name = "StrokeColorRamp_1"
                 ramp_node.location = (-900, 300)
                 links.new(img_node.outputs["Color"], ramp_node.inputs["Fac"])
-                update_ramp_node(ramp_node)
+                
+                target_colors = _get_target_colors_from_ui(props)
+                _apply_colors_to_ramp(ramp_node, target_colors, props.color_mixer, props.color_mixer_offset)
+
                 bsdf_node = nodes.new("ShaderNodeBsdfPrincipled")
                 bsdf_node.parent = base_color_frame
                 bsdf_node.name = "StrokeBSDF_1"
@@ -3143,11 +3179,13 @@ class AutoStrokeOperator(Operator):
                 links.new(disp_node.outputs["Displacement"], mat_out.inputs["Displacement"])
                 links.new(bsdf_node.outputs["BSDF"], mat_out.inputs["Surface"])
             new_curve.data.materials.append(mat)
-            update_material_properties(context)
-            update_extrusion(context)
-            update_extras_strokes(context)
+            update_material_properties(props, context)
+            update_extrusion(props, context)
+            update_extras_strokes(props, context)
             update_solidify_modifier(props, context)
             bpy.ops.object.mode_set(mode='EDIT')
+            # Set the active tool to Draw
+            bpy.ops.wm.tool_set_by_id(name="builtin.draw")
             update_effect_nodes(context)
             self.report({'INFO'}, "Stroke added successfully.")
             return {'FINISHED'}
@@ -3246,6 +3284,52 @@ class PAINTERLY_OT_CancelEffect(Operator):
         context.window_manager.painterly_cancel_requested = True
         self.report({'INFO'}, "Cancellation requested.")
         return {'FINISHED'}
+
+def find_source_image_node_recursive(start_socket, visited_nodes):
+    """
+    Recursively traces back through node links from a starting socket
+    to find the first connected Image Texture node.
+    """
+    # Priority of input sockets to check when traversing a node backwards
+    INPUT_PRIORITY = ["Color", "Fac", "Image", "Vector"]
+
+    # Base case: The socket has no incoming connection
+    if not start_socket.is_linked:
+        return None
+
+    from_node = start_socket.links[0].from_node
+    
+    # Base case: We found an Image Texture node
+    if from_node.type == 'TEX_IMAGE' and from_node.image:
+        return from_node
+
+    # Avoid infinite loops in complex node setups
+    if from_node in visited_nodes:
+        return None
+    visited_nodes.add(from_node)
+
+    # Recursive step: Check the inputs of the current node
+    sorted_inputs = sorted(
+        [s for s in from_node.inputs if s.type != 'SHADER'], 
+        key=lambda s: INPUT_PRIORITY.index(s.name) if s.name in INPUT_PRIORITY else 99
+    )
+
+    for input_socket in sorted_inputs:
+        found_node = find_source_image_node_recursive(input_socket, visited_nodes)
+        if found_node:
+            return found_node
+            
+    return None
+
+def find_source_image_node(start_node, socket_name):
+    """
+    Wrapper to initiate the recursive search for a source Image Texture node.
+    """
+    if not start_node or socket_name not in start_node.inputs:
+        return None
+        
+    return find_source_image_node_recursive(start_node.inputs[socket_name], set())
+
 
 class PainterlyEffectOperator(Operator):
     bl_idname = "texture.apply_painterly_effect"
@@ -3379,17 +3463,17 @@ class PainterlyEffectOperator(Operator):
 
             bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
             if bsdf:
-                if bsdf.inputs['Base Color'].is_linked:
-                    from_node = bsdf.inputs['Base Color'].links[0].from_node
-                    if from_node.type == 'TEX_IMAGE' and from_node.image:
-                        self._source_color_images[mat.name] = from_node.image
-                
+                color_tex_node = find_source_image_node(bsdf, 'Base Color')
+                if color_tex_node:
+                    self._source_color_images[mat.name] = color_tex_node.image
+
+                normal_tex_node = None
                 if bsdf.inputs['Normal'].is_linked:
-                    from_node = bsdf.inputs['Normal'].links[0].from_node
-                    if from_node.type == 'NORMAL_MAP' and from_node.inputs['Color'].is_linked:
-                        from_node_2 = from_node.inputs['Color'].links[0].from_node
-                        if from_node_2.type == 'TEX_IMAGE' and from_node_2.image:
-                            self._source_normal_images[mat.name] = from_node_2.image
+                    normal_map_node = bsdf.inputs['Normal'].links[0].from_node
+                    if normal_map_node.type == 'NORMAL_MAP':
+                        normal_tex_node = find_source_image_node(normal_map_node, 'Color')
+                if normal_tex_node:
+                    self._source_normal_images[mat.name] = normal_tex_node.image
 
             if stylized_props.enable_color_pass and mat.name not in self._source_color_images:
                  self.report({'WARNING'}, f"Material '{mat.name}' has no Image Texture for Color Pass. Skipping Color Pass.")
@@ -3933,7 +4017,7 @@ class StrokeBrushPanel(Panel):
                         management_box = geo_node_box.box()
                         col = management_box.column(align=True)
                         col.label(text="Management", icon='TOOL_SETTINGS')
-                        col.operator("painterly.add_primary_stroke", text="New Primary from Active", icon='FORCE_CURVE')
+                        col.operator("painterly.add_primary_stroke", text="New Base Object", icon='FORCE_CURVE')
 
                         row = col.row(align=True)
                         row.prop(geo_props, "target_primary_collection", text="Target")
@@ -4129,7 +4213,11 @@ class StrokeBrushPanel(Panel):
             op_next = row2.operator("painterly.navigate_folder", text=">")
             op_next.folder_type = 'stroke'
             op_next.direction = 'NEXT'
-        box.operator("object.auto_stroke", text="Add Stroke", icon='PLUS')
+
+        action_row = box.row()
+        action_row.scale_y = 1.5
+        action_row.operator("object.auto_stroke", text="Add Stroke", icon='ERROR')
+        
         box2 = layout.box()
         box2.label(text="Normal Map Selection")
         rowN = box2.row(align=True)
@@ -4401,13 +4489,19 @@ class StrokeBrushPanel(Panel):
         is_processing = getattr(context.window_manager, 'painterly_is_processing', False)
         
         if not check_pillow():
-            layout.operator("painterly.install_dependencies", text="Install Dependencies", icon='IMPORT')
+            action_row = layout.row()
+            action_row.scale_y = 1.5
+            action_row.operator("painterly.install_dependencies", text="Install Dependencies", icon='IMPORT')
         elif is_processing:
-            layout.operator("painterly.cancel_effect", text="CANCEL", icon='CANCEL', depress=True)
+            action_row = layout.row()
+            action_row.scale_y = 1.5
+            action_row.operator("painterly.cancel_effect", text="CANCEL", icon='CANCEL', depress=True)
             progress_text = getattr(context.window_manager, 'painterly_progress_text', "")
             layout.label(text=f"Processing... {progress_text}")
         else:
-            layout.operator("texture.apply_painterly_effect", text="Apply Painterly Effect", icon='PLUS')
+            action_row = layout.row()
+            action_row.scale_y = 1.5
+            action_row.operator("texture.apply_painterly_effect", text="Apply Painterly Effect", icon='ERROR')
 
         layout.label(text="Processing may take a moment.", icon='INFO')
 
@@ -4511,20 +4605,23 @@ def register():
     except Exception as exc:
         print("[Painterly] auto-detect failed during register:", exc)
     
+    # Register the new efficient frame change handler
+    if painterly_frame_change_handler not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(painterly_frame_change_handler)
+
     if painterly_load_post_handler not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(painterly_load_post_handler)
-    if painterly_frame_change_post not in bpy.app.handlers.frame_change_post:
-        bpy.app.handlers.frame_change_post.append(painterly_frame_change_post)
     if painterly_depsgraph_update_post not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(painterly_depsgraph_update_post)
 
 def unregister():
     global custom_icons
 
+    # Unregister all handlers
+    if painterly_frame_change_handler in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(painterly_frame_change_handler)
     if painterly_depsgraph_update_post in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(painterly_depsgraph_update_post)
-    if painterly_frame_change_post in bpy.app.handlers.frame_change_post:
-        bpy.app.handlers.frame_change_post.remove(painterly_frame_change_post)
     if painterly_load_post_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(painterly_load_post_handler)
     
