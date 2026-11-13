@@ -1,7 +1,7 @@
 {
     "version": [3, 1, 0],
     "url": "https://raw.githubusercontent.com/Doughy-animation/Painterly/refs/heads/main/__init__.py",
-    "changelog": "we've completely reworked the MODEL placement mode for the Stroke Pen tool, fixed issues with SURFACE placement mode and also fixed issues with "Z-fighting" among placed strokes. "
+    "changelog": "we've completely reworked the MODEL placement mode for the Stroke Pen tool, fixed issues with SURFACE placement mode and also fixed issues with Z-fighting among placed strokes. "
 }
 
 
